@@ -1,0 +1,39 @@
+#!/bin/sh
+# 99-obackup-init: first-run setup after the package is installed.
+
+chmod 0755 /usr/bin/obackup 2>/dev/null
+chmod 0755 /usr/libexec/rpcd/obackup 2>/dev/null
+
+# rpcd only scans /usr/libexec/rpcd when it starts, so until it is told to look
+# again the "obackup" ubus object does not exist and every call from the LuCI
+# page fails with "Object not found". Both forms are tried because reload is a
+# no-op on some releases, and the whole thing is allowed to fail: during a
+# first boot rpcd is not running yet and will pick the plugin up by itself.
+if [ -z "$IPKG_INSTROOT" ]; then
+    /etc/init.d/rpcd reload >/dev/null 2>&1 ||
+        /etc/init.d/rpcd restart >/dev/null 2>&1 ||
+        true
+fi
+
+# Signing key for backups. It is created once and then preserved across every
+# sysupgrade, so a backup can be proved to have come from this router and to
+# have not been altered while it sat on a USB stick.
+if command -v usign >/dev/null 2>&1; then
+    if [ ! -s /etc/obackup/key.sec ] || [ ! -s /etc/obackup/key.pub ]; then
+        mkdir -p /etc/obackup 2>/dev/null
+        chmod 0700 /etc/obackup 2>/dev/null
+        rm -f /etc/obackup/key.sec /etc/obackup/key.pub
+        if usign -G -s /etc/obackup/key.sec -p /etc/obackup/key.pub >/dev/null 2>&1; then
+            chmod 0600 /etc/obackup/key.sec 2>/dev/null
+            chmod 0644 /etc/obackup/key.pub 2>/dev/null
+        fi
+    fi
+fi
+
+# Keep the key across firmware upgrades.
+touch /etc/sysupgrade.conf 2>/dev/null
+if ! grep -Fxq /etc/obackup /etc/sysupgrade.conf 2>/dev/null; then
+    echo /etc/obackup >> /etc/sysupgrade.conf 2>/dev/null
+fi
+
+exit 0

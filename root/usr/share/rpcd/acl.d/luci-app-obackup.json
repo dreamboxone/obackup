@@ -1,0 +1,15 @@
+{
+  "luci-app-obackup": {
+    "description": "Read the package list and backup status, and start a backup or restore",
+    "read": {
+      "ubus": {
+        "obackup": [ "status", "scan", "backup_info", "job_status", "report" ]
+      }
+    },
+    "write": {
+      "ubus": {
+        "obackup": [ "start_backup", "start_restore", "delete_backup" ]
+      }
+    }
+  }
+}

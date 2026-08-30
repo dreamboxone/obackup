@@ -1,0 +1,13 @@
+{
+  "admin/system/obackup": {
+    "title": "Obackup",
+    "order": 60,
+    "action": {
+      "type": "view",
+      "path": "obackup/main"
+    },
+    "depends": {
+      "acl": [ "luci-app-obackup" ]
+    }
+  }
+}

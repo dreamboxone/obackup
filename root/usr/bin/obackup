@@ -1,0 +1,1939 @@
+#!/bin/sh
+# Obackup - carries the packages you installed yourself, their settings and
+# their service state across an OpenWrt sysupgrade, including upgrades that
+# jump between OpenWrt releases (21.02 ... 25.12) and between opkg and apk.
+#
+# GitHub: https://github.com/dreamboxone/obackup
+# Telegram: t.me/routekernel1
+
+OBACKUP_VERSION="1.0.3"
+
+. /usr/share/libubox/jshn.sh
+
+LOG_FILE="/var/log/obackup.log"
+CACHE_INVENTORY="/tmp/obackup_inventory_cache.tmp"
+CACHE_HASH_FILE="/tmp/obackup_combined_hash.tmp"
+APK_INSTALLED_CACHE="/tmp/obackup_apk_installed.tmp"
+JOB_STATUS_FILE="/var/run/obackup_job.json"
+LOCK_DIR="/var/run/obackup.lockdir"
+TARGET_PATH_FILE="/etc/obackup_target_path"
+KEY_DIR="/etc/obackup"
+KEY_SEC="$KEY_DIR/key.sec"
+KEY_PUB="$KEY_DIR/key.pub"
+# Lives in /usr, which sysupgrade wipes and never preserves. Its absence is
+# what tells the boot hook that the firmware was just replaced.
+OVERLAY_SENTINEL="/usr/lib/obackup/overlay-intact"
+
+log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >> "$LOG_FILE"
+}
+
+set_job_status() {
+    status_state="$1"
+    status_msg="$2"
+    status_progress="$3"
+
+    json_init
+    json_add_string "state" "$status_state"
+    json_add_string "message" "$status_msg"
+    json_add_int "progress" "${status_progress:-0}"
+    json_add_int "timestamp" "$(date +%s)"
+    json_dump > "$JOB_STATUS_FILE"
+}
+
+# Only ever write into a directory that is unmistakably ours, so a bad mount
+# point or a truncated variable can never make us delete something else.
+validate_target_dir() {
+    case "$1" in
+        /mnt/*/obackup_storage|/media/*/obackup_storage|/etc/obackup_storage|\
+        /mnt/*/obackup_storage.new|/media/*/obackup_storage.new|/etc/obackup_storage.new|\
+        /mnt/*/obackup_storage.old|/media/*/obackup_storage.old|/etc/obackup_storage.old) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# -------------------------------------------------------------
+# 1. Environment inspection
+# -------------------------------------------------------------
+detect_pkg_mgr() {
+    if command -v apk >/dev/null 2>&1 && [ -d /etc/apk ]; then
+        echo "apk"
+    else
+        echo "opkg"
+    fi
+}
+
+PKG_MGR=$(detect_pkg_mgr)
+
+SYS_RELEASE="unknown"
+SYS_ARCH="unknown"
+SYS_TARGET="unknown"
+if [ -f /etc/openwrt_release ]; then
+    . /etc/openwrt_release
+    SYS_RELEASE="${DISTRIB_RELEASE:-unknown}"
+    SYS_ARCH="${DISTRIB_ARCH:-unknown}"
+    SYS_TARGET="${DISTRIB_TARGET:-unknown}"
+fi
+
+get_sys_info_json() {
+    json_init
+    json_add_string "release" "$SYS_RELEASE"
+    json_add_string "arch" "$SYS_ARCH"
+    json_add_string "target" "$SYS_TARGET"
+    json_add_string "pkg_manager" "$PKG_MGR"
+    json_add_string "obackup_version" "$OBACKUP_VERSION"
+    json_add_int "timestamp" "$(date +%s)"
+    json_dump
+}
+
+# -------------------------------------------------------------
+# 2. Package artifact metadata
+# -------------------------------------------------------------
+# An OpenWrt .ipk is a gzip tar holding control.tar.gz and data.tar.gz. Very
+# old builds used the ar container instead, so both are handled. Unpacking into
+# a temp dir avoids guessing whether members are stored as "./control" or
+# "control", which differs between builders.
+extract_ipk_metadata() {
+    ipk_path="$1"
+    field="$2"
+    [ -f "$ipk_path" ] || return 1
+    # Resolved up front: the unpacking below runs from a temp directory, where
+    # a relative path would no longer point at the archive.
+    case "$ipk_path" in
+        /*) ;;
+        *) ipk_path="$(pwd)/$ipk_path" ;;
+    esac
+
+    tmpd="/tmp/obackup_ipkmeta.$$"
+    rm -rf "$tmpd"
+    mkdir -p "$tmpd" || return 1
+
+    ( cd "$tmpd" && tar -xzf "$ipk_path" ) >/dev/null 2>&1
+    if [ ! -f "$tmpd/control.tar.gz" ] && command -v ar >/dev/null 2>&1; then
+        ( cd "$tmpd" && ar x "$ipk_path" control.tar.gz ) >/dev/null 2>&1
+    fi
+
+    meta_val=""
+    if [ -f "$tmpd/control.tar.gz" ]; then
+        ( cd "$tmpd" && tar -xzf control.tar.gz ) >/dev/null 2>&1
+        if [ -f "$tmpd/control" ]; then
+            meta_val=$(awk -v f="$field:" \
+                '$1 == f { $1=""; sub(/^[ \t]+/, ""); print; exit }' "$tmpd/control")
+        fi
+    fi
+
+    rm -rf "$tmpd"
+    [ -n "$meta_val" ] || return 1
+    printf '%s\n' "$meta_val"
+}
+
+# apk-tools v3 (OpenWrt 25.12) stores packages as ADB containers, not tarballs,
+# so "tar -zxOf pkg.apk .PKGINFO" cannot work there - it makes tar exit 2.
+# Ask apk itself for v3 and fall back to the v2 .PKGINFO layout.
+# Accepted fields: name, version, arch.
+extract_apk_metadata() {
+    apk_path="$1"
+    field="$2"
+    [ -f "$apk_path" ] || return 1
+
+    meta_val=""
+    if [ "$(head -c 3 "$apk_path" 2>/dev/null)" = "ADB" ]; then
+        command -v apk >/dev/null 2>&1 || return 1
+        meta_val=$(apk adbdump "$apk_path" 2>/dev/null | awk -v f="$field:" '
+            $1 == f {
+                $1 = ""
+                sub(/^[ \t]+/, "")
+                gsub(/^"|"$/, "")
+                print
+                exit
+            }')
+    else
+        case "$field" in
+            name)    pk_field="pkgname" ;;
+            version) pk_field="pkgver" ;;
+            *)       pk_field="$field" ;;
+        esac
+        meta_val=$(tar -zxOf "$apk_path" .PKGINFO 2>/dev/null |
+            awk -F' = ' -v f="$pk_field" '$1 == f { print $2; exit }')
+    fi
+
+    [ -n "$meta_val" ] || return 1
+    printf '%s\n' "$meta_val"
+}
+
+# apk names a fetched file "<name>-<version>.apk", which is the cheapest and
+# most reliable identity check. Reading the container is only a fallback.
+apk_artifact_matches() {
+    want_name="$1"
+    want_ver="$2"
+    art_file="$3"
+
+    [ "$(basename "$art_file")" = "${want_name}-${want_ver}.apk" ] && return 0
+
+    got_name=$(extract_apk_metadata "$art_file" "name") || return 1
+    got_ver=$(extract_apk_metadata "$art_file" "version") || return 1
+    [ "$got_name" = "$want_name" ] && [ "$got_ver" = "$want_ver" ]
+}
+
+# -------------------------------------------------------------
+# 3. Installed package queries
+# -------------------------------------------------------------
+# Cache "name-version" for every installed apk package once. Asking apk per
+# package turns a few hundred packages into a few hundred process spawns.
+build_apk_installed_cache() {
+    [ -s "$APK_INSTALLED_CACHE" ] && return 0
+    { apk list --installed 2>/dev/null || apk info -v 2>/dev/null; } |
+        awk '{ print $1 }' > "$APK_INSTALLED_CACHE"
+}
+
+get_apk_installed_version() {
+    pkg_name="$1"
+    build_apk_installed_cache
+    # Prefix comparison by length rather than regex: package names contain
+    # characters such as + and . that a regex would mis-handle.
+    awk -v p="$pkg_name" '
+        {
+            n = length(p)
+            if (substr($1, 1, n + 1) == p "-") {
+                v = substr($1, n + 2)
+                if (v ~ /^[0-9]/) { print v; exit }
+            }
+        }' "$APK_INSTALLED_CACHE"
+}
+
+get_opkg_installed_version() {
+    opkg status "$1" 2>/dev/null | awk '/^Version: / { print $2; exit }'
+}
+
+get_installed_version() {
+    if [ "$PKG_MGR" = "opkg" ]; then
+        get_opkg_installed_version "$1"
+    else
+        get_apk_installed_version "$1"
+    fi
+}
+
+# Packages that belong to the firmware image itself. The new image ships its
+# own copies, and dragging an old one forward is exactly how a cross-release
+# restore bricks a router, so these are never queued.
+is_system_package() {
+    case "$1" in
+        busybox|procd|procd-*|ubus|ubusd|libubus*|uci|libuci*|libubox*|jshn|\
+        uhttpd|uhttpd-*|dnsmasq|dnsmasq-*|odhcpd|odhcpd-*|odhcp6c|\
+        firewall|firewall4|nftables|nftables-*|iptables|iptables-*|netifd|\
+        luci|luci-base|luci-mod-*|\
+        rpcd|rpcd-mod-*|ca-bundle|ca-certificates|tar|block-mount|\
+        libc|musl|libpthread|librt|libgcc|libgcc1|ldd|libatomic|libssp|\
+        kernel|base-files|opkg|apk|apk-mbedtls|apk-openssl|usign|fstools|\
+        fwtool|jsonfilter|logd|mtd|swconfig|ubox|urandom-seed|urngd|\
+        wireless-regdb|zlib|libnl-tiny|libjson-c*|libblobmsg-json*|\
+        libustream-*|libopenssl*|libmbedtls*|libwolfssl*)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# Kernel modules are locked to the exact kernel the image was built with.
+is_kmod_package() {
+    case "$1" in
+        kmod-*) return 0 ;;
+    esac
+    return 1
+}
+
+# -------------------------------------------------------------
+# 4. Inventory: everything that is not part of the factory image
+# -------------------------------------------------------------
+# A sysupgrade wipes every package that did not come with the firmware, not
+# just third-party ones. So the backup set is "installed minus factory", and
+# the feed origin is recorded as a label for the user rather than as a filter.
+list_rom_packages() {
+    if [ "$PKG_MGR" = "opkg" ]; then
+        if [ -f /rom/usr/lib/opkg/status ]; then
+            awk '/^Package: / { print $2 }' /rom/usr/lib/opkg/status | sort -u
+            return 0
+        fi
+    else
+        # apk keeps its own installed database, but /rom/etc/apk/world is plain
+        # text on every apk release and survives format changes.
+        if [ -f /rom/lib/apk/db/installed ] &&
+           grep -qs '^P:' /rom/lib/apk/db/installed; then
+            awk '/^P:/ { print substr($0, 3) }' /rom/lib/apk/db/installed | sort -u
+            return 0
+        fi
+        if [ -f /rom/etc/apk/world ]; then
+            sed -E 's/[<>=~].*$//' /rom/etc/apk/world | grep -v '^[[:space:]]*$' | sort -u
+            return 0
+        fi
+    fi
+    return 1
+}
+
+list_installed_packages() {
+    if [ "$PKG_MGR" = "opkg" ]; then
+        awk '
+            BEGIN { RS = ""; FS = "\n" }
+            {
+                pkg = ""; ver = ""; stat = ""; pkg_sz = "0"; inst_sz = "0"
+                for (i = 1; i <= NF; i++) {
+                    if ($i ~ /^Package: /)        { pkg     = substr($i, 10) }
+                    else if ($i ~ /^Version: /)   { ver     = substr($i, 10) }
+                    else if ($i ~ /^Size: /)      { pkg_sz  = substr($i, 7)  }
+                    else if ($i ~ /^Installed-Size: /) { inst_sz = substr($i, 17) }
+                    else if ($i ~ /^Status: /)    { stat    = $i }
+                }
+                if (pkg != "" && stat ~ /installed/) {
+                    print pkg "|" ver "|" pkg_sz "|" inst_sz
+                }
+            }' /usr/lib/opkg/status 2>/dev/null
+    else
+        build_apk_installed_cache
+        while IFS= read -r tok; do
+            [ -z "$tok" ] && continue
+            # "name-1.2.3-r1" -> split at the last dash that starts a digit run.
+            iname=$(printf '%s' "$tok" | sed -E 's/-[0-9][^-]*(-r[0-9]+)?$//')
+            [ -z "$iname" ] && continue
+            iver=${tok#"$iname"-}
+            [ "$iver" = "$tok" ] && continue
+            printf '%s|%s|0|0\n' "$iname" "$iver"
+        done < "$APK_INSTALLED_CACHE"
+    fi
+}
+
+# Names known to the official distribution feeds, used purely to label a
+# package as coming from OpenWrt itself or from somewhere else.
+build_official_index() {
+    out_file="$1"
+    : > "$out_file"
+
+    if [ "$PKG_MGR" = "opkg" ]; then
+        [ -f /etc/opkg/distfeeds.conf ] || return 0
+        awk '{ print $2 }' /etc/opkg/distfeeds.conf 2>/dev/null | while IFS= read -r feed_name; do
+            [ -n "$feed_name" ] || continue
+            [ -f "/var/opkg-lists/$feed_name" ] || continue
+            awk '/^Package: / { print $2 }' "/var/opkg-lists/$feed_name"
+        done | sort -u > "$out_file"
+    else
+        for idx in /var/cache/apk/APKINDEX.*.tar.gz; do
+            [ -f "$idx" ] || continue
+            case "$(basename "$idx")" in
+                *openwrt.org*) ;;
+                *) continue ;;
+            esac
+            tar -zxOf "$idx" APKINDEX 2>/dev/null | awk '/^P:/ { print substr($0, 3) }'
+        done | sort -u > "$out_file"
+    fi
+}
+
+# Output: name|version|size|installed_size|origin
+get_custom_packages() {
+    combined_hash=""
+    if [ "$PKG_MGR" = "opkg" ]; then
+        combined_hash=$(sha256sum /usr/lib/opkg/status /rom/usr/lib/opkg/status \
+            /etc/opkg/distfeeds.conf /etc/opkg/customfeeds.conf 2>/dev/null |
+            sha256sum | awk '{ print $1 }')
+    else
+        combined_hash=$(sha256sum /lib/apk/db/installed /etc/apk/world \
+            /rom/etc/apk/world /etc/apk/repositories 2>/dev/null |
+            sha256sum | awk '{ print $1 }')
+    fi
+
+    cached_hash=$(cat "$CACHE_HASH_FILE" 2>/dev/null)
+    if [ -s "$CACHE_INVENTORY" ] && [ -n "$combined_hash" ] &&
+       [ "$combined_hash" = "$cached_hash" ]; then
+        cat "$CACHE_INVENTORY"
+        return 0
+    fi
+
+    rom_list="/tmp/obackup_rom.tmp"
+    official_list="/tmp/obackup_official.tmp"
+    out_tmp="/tmp/obackup_raw_inventory.tmp"
+    : > "$out_tmp"
+
+    have_rom=0
+    if list_rom_packages > "$rom_list" 2>/dev/null && [ -s "$rom_list" ]; then
+        have_rom=1
+    fi
+    build_official_index "$official_list"
+
+    list_installed_packages | while IFS='|' read -r pname pver ppkg_sz pinst_sz; do
+        [ -n "$pname" ] || continue
+        is_system_package "$pname" && continue
+
+        if [ "$have_rom" = "1" ]; then
+            # Present in the factory image with no local change: the new
+            # firmware will ship it again, so there is nothing to preserve.
+            grep -Fxq "$pname" "$rom_list" 2>/dev/null && continue
+            origin_val="third-party"
+            if [ -s "$official_list" ] && grep -Fxq "$pname" "$official_list" 2>/dev/null; then
+                origin_val="official-feed"
+            fi
+        else
+            # No /rom to compare against (ext4 images, for example). Fall back
+            # to the feed index and be explicit that this is a guess.
+            if [ -s "$official_list" ] && grep -Fxq "$pname" "$official_list" 2>/dev/null; then
+                continue
+            fi
+            origin_val="unverified"
+        fi
+
+        printf '%s|%s|%s|%s|%s\n' \
+            "$pname" "$pver" "${ppkg_sz:-0}" "${pinst_sz:-0}" "$origin_val" >> "$out_tmp"
+    done
+
+    rm -f "$rom_list" "$official_list"
+
+    [ -n "$combined_hash" ] && printf '%s\n' "$combined_hash" > "$CACHE_HASH_FILE"
+    cp -f "$out_tmp" "$CACHE_INVENTORY" 2>/dev/null
+    cat "$out_tmp"
+    rm -f "$out_tmp"
+}
+
+# -------------------------------------------------------------
+# 5. Storage selection
+# -------------------------------------------------------------
+is_removable_device() {
+    dev_path="$1"
+    dev_name=$(basename "$dev_path")
+
+    case "$dev_name" in
+        loop*|ram*|mtdblock*|zram*|mmcblk*boot*|mmcblk*rpmb) return 1 ;;
+    esac
+
+    disk_name=$(printf '%s' "$dev_name" | sed -E 's/p?[0-9]+$//')
+    if [ -f "/sys/block/$disk_name/removable" ]; then
+        [ "$(cat "/sys/block/$disk_name/removable" 2>/dev/null)" = "1" ] && return 0
+    fi
+    return 1
+}
+
+estimate_required_kb() {
+    pkg_bytes=0
+    tmp_calc="/tmp/obackup_calc.tmp"
+    get_custom_packages > "$tmp_calc"
+
+    while IFS='|' read -r _pn _pv psz isz _po; do
+        [ -n "$_pn" ] || continue
+        if [ "${psz:-0}" -gt 0 ] 2>/dev/null; then
+            chosen=$psz
+        elif [ "${isz:-0}" -gt 0 ] 2>/dev/null; then
+            chosen=$(( isz / 2 ))
+        else
+            chosen=1048576
+        fi
+        pkg_bytes=$(( pkg_bytes + chosen ))
+    done < "$tmp_calc"
+    rm -f "$tmp_calc"
+
+    app_bytes=0
+    for adir in /etc/openclash /etc/passwall /etc/passwall2 /etc/xray /etc/sing-box \
+                /etc/mosdns /etc/mihomo /etc/homeproxy /etc/v2ray /etc/shadowsocks* \
+                /var/lib/openclash /var/lib/passwall* /usr/share/openclash /usr/share/passwall*; do
+        [ -d "$adir" ] || continue
+        sz=$(du -sk "$adir" 2>/dev/null | awk '{ print $1 * 1024 }')
+        app_bytes=$(( app_bytes + ${sz:-0} ))
+    done
+
+    cfg_bytes=$(du -sk /etc/config /etc/opkg /etc/apk 2>/dev/null | awk '{ s += $1 } END { print s * 1024 }')
+    raw_total=$(( pkg_bytes + app_bytes + ${cfg_bytes:-0} ))
+
+    # Doubled for the bundle tarball, plus 30 MB of head-room.
+    echo $(( (raw_total * 2 / 1024) + 30720 ))
+}
+
+get_target_dir() {
+    req_kb=$(estimate_required_kb)
+
+    # 1. Keep using a storage directory that already exists.
+    while read -r dev mnt _fstype _opt _rest; do
+        case "$mnt" in
+            /|/rom|/overlay|/tmp|/dev*|/proc*|/sys*) continue ;;
+        esac
+        if [ -d "$mnt/obackup_storage" ] && touch "$mnt/obackup_storage/.test" 2>/dev/null; then
+            rm -f "$mnt/obackup_storage/.test"
+            free=$(df -k "$mnt" 2>/dev/null | awk 'NR==2 { print $4 }')
+            if [ "${free:-0}" -ge "$req_kb" ] 2>/dev/null; then
+                echo "$mnt/obackup_storage"
+                return 0
+            fi
+        fi
+    done < /proc/mounts
+
+    # 2. Otherwise the removable disk with the most free space.
+    best_path=""
+    best_free=0
+    while read -r dev mnt _fstype _opt _rest; do
+        case "$mnt" in
+            /|/rom|/overlay|/tmp|/dev*|/proc*|/sys*) continue ;;
+        esac
+        is_removable_device "$dev" || continue
+        [ -d "$mnt" ] || continue
+        touch "$mnt/.obackup_test" 2>/dev/null || continue
+        rm -f "$mnt/.obackup_test"
+        free=$(df -k "$mnt" 2>/dev/null | awk 'NR==2 { print $4 }')
+        free=${free:-0}
+        if [ "$free" -gt "$best_free" ] 2>/dev/null; then
+            best_free=$free
+            best_path="$mnt"
+        fi
+    done < /proc/mounts
+
+    if [ "$best_free" -ge "$req_kb" ] 2>/dev/null; then
+        echo "$best_path/obackup_storage"
+        return 0
+    fi
+
+    # 3. Fall back to internal flash.
+    overlay_free=$(df -k /overlay 2>/dev/null | awk 'NR==2 { print $4 }')
+    [ -z "$overlay_free" ] && overlay_free=$(df -k / 2>/dev/null | awk 'NR==2 { print $4 }')
+    if [ "${overlay_free:-0}" -ge "$req_kb" ] 2>/dev/null; then
+        echo "/etc/obackup_storage"
+    else
+        echo "ERR_NO_SPACE"
+    fi
+}
+
+# Cheap answer for the status page: never runs a full package scan.
+get_fast_target_dir() {
+    if [ -f "$TARGET_PATH_FILE" ]; then
+        saved=$(cat "$TARGET_PATH_FILE" 2>/dev/null)
+        if [ -n "$saved" ] && [ -d "$saved" ]; then
+            printf '%s\n' "$saved"
+            return 0
+        fi
+    fi
+
+    while read -r dev mnt _fstype _opt _rest; do
+        case "$mnt" in
+            /|/rom|/overlay|/tmp|/dev*|/proc*|/sys*) continue ;;
+        esac
+        if is_removable_device "$dev" && [ -d "$mnt" ]; then
+            echo "$mnt/obackup_storage"
+            return 0
+        fi
+    done < /proc/mounts
+
+    echo "/etc/obackup_storage"
+}
+
+# Same problem as in the recovery runner: jshn writes JSON on one line.
+read_json_field() {
+    rj_file="$1"
+    rj_key="$2"
+    [ -f "$rj_file" ] || return 1
+
+    rj_val=""
+    if command -v jsonfilter >/dev/null 2>&1; then
+        rj_val=$(jsonfilter -i "$rj_file" -e "@.$rj_key" 2>/dev/null)
+    fi
+    if [ -z "$rj_val" ]; then
+        rj_val=$(tr ',' '\n' < "$rj_file" |
+            awk -F'"' -v k="$rj_key" '$2 == k { print $4; exit }')
+    fi
+    if [ -z "$rj_val" ]; then
+        # Numbers are unquoted, so the field after the colon is what matters.
+        rj_val=$(tr ',' '\n' < "$rj_file" |
+            awk -F'"' -v k="$rj_key" '$2 == k { sub(/^[^:]*:[ \t]*/, "", $3); gsub(/[^0-9]/, "", $3); print $3; exit }')
+    fi
+
+    printf '%s\n' "$rj_val"
+}
+
+find_backup_dir() {
+    if [ -f "$TARGET_PATH_FILE" ]; then
+        fb_saved=$(cat "$TARGET_PATH_FILE" 2>/dev/null)
+        if [ -n "$fb_saved" ] && [ -f "$fb_saved/manifest/packages.list" ]; then
+            printf '%s\n' "$fb_saved"
+            return 0
+        fi
+    fi
+
+    for fb_cand in /etc/obackup_storage /mnt/*/obackup_storage /media/*/obackup_storage; do
+        if [ -f "$fb_cand/manifest/packages.list" ]; then
+            printf '%s\n' "$fb_cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+count_lines() {
+    [ -f "$1" ] || { echo 0; return 0; }
+    cl=$(grep -c . "$1" 2>/dev/null)
+    echo "${cl:-0}"
+}
+
+# What the LuCI page shows about the backup that is already on this router.
+get_backup_info_json() {
+    bi_dir=$(find_backup_dir)
+
+    json_init
+    if [ -z "$bi_dir" ]; then
+        json_add_boolean "exists" 0
+        json_dump
+        return 0
+    fi
+
+    bi_man="$bi_dir/manifest"
+
+    json_add_boolean "exists" 1
+    json_add_string "path" "$bi_dir"
+    json_add_int "packages" "$(count_lines "$bi_man/packages.list")"
+    json_add_int "configs" "$(count_lines "$bi_man/configs_map.list")"
+    json_add_int "services" "$(count_lines "$bi_man/services.list")"
+
+    bi_incomplete=0
+    if [ -f "$bi_man/packages.list" ]; then
+        bi_incomplete=$(grep -Ec '\|(MISSING_ARTIFACT|ONLINE_FEED_ONLY)\|' "$bi_man/packages.list" 2>/dev/null)
+    fi
+    json_add_int "incomplete" "${bi_incomplete:-0}"
+
+    bi_created=$(read_json_field "$bi_man/system.json" timestamp)
+    case "$bi_created" in
+        ''|*[!0-9]*) bi_created=$(date -r "$bi_man/packages.list" +%s 2>/dev/null) ;;
+    esac
+    json_add_int "created" "${bi_created:-0}"
+
+    json_add_string "source_release"     "$(read_json_field "$bi_man/system.json" release)"
+    json_add_string "source_arch"        "$(read_json_field "$bi_man/system.json" arch)"
+    json_add_string "source_pkg_manager" "$(read_json_field "$bi_man/system.json" pkg_manager)"
+    json_add_string "made_by"            "$(read_json_field "$bi_man/system.json" obackup_version)"
+
+    if [ -f "$bi_man/root.sha256.sig" ]; then
+        json_add_boolean "signed" 1
+    else
+        json_add_boolean "signed" 0
+    fi
+    if [ -x "$bi_dir/recovery/restore.sh" ]; then
+        json_add_boolean "runnable" 1
+    else
+        json_add_boolean "runnable" 0
+    fi
+
+    bi_size=$(du -sk "$bi_dir" 2>/dev/null | awk '{ print $1 }')
+    json_add_int "size_kb" "${bi_size:-0}"
+
+    bi_bundle="$bi_dir/obackup-bundle-latest.tar.gz"
+    if [ -f "$bi_bundle" ]; then
+        json_add_string "bundle" "$(basename "$bi_bundle")"
+        bi_bsize=$(du -k "$bi_bundle" 2>/dev/null | awk '{ print $1 }')
+        json_add_int "bundle_kb" "${bi_bsize:-0}"
+    fi
+
+    json_dump
+}
+
+# -------------------------------------------------------------
+# 6. Dependency discovery
+# -------------------------------------------------------------
+# Emits "name|operator|version" per dependency.
+get_package_dependencies() {
+    dep_pkg="$1"
+    if [ "$PKG_MGR" = "opkg" ]; then
+        opkg status "$dep_pkg" 2>/dev/null |
+            awk -F': ' '/^Depends: / { print $2 }' | tr ',' '\n' |
+            while IFS= read -r dep; do
+                [ -n "$dep" ] || continue
+                dname=$(printf '%s' "$dep" | awk '{ print $1 }')
+                [ -n "$dname" ] || continue
+                dop=$(printf '%s' "$dep" | awk -F'[()]' '{ print $2 }' | awk '{ print $1 }')
+                dver=$(printf '%s' "$dep" | awk -F'[()]' '{ print $2 }' | awk '{ print $2 }')
+                printf '%s|%s|%s\n' "$dname" "${dop:-=}" "${dver:-any}"
+            done
+    else
+        apk info -R "$dep_pkg" 2>/dev/null | while IFS= read -r dep; do
+            [ -n "$dep" ] || continue
+            case "$dep" in
+                # apk prefixes its output with "<pkg>-<ver> depends on:".
+                # Header lines are the only ones that end in a colon.
+                *:) continue ;;
+                # Virtual capabilities, not real package names.
+                so:*|pc:*|cmd:*|!*) continue ;;
+                # Anything with whitespace is not a package name.
+                *\ *|*"	"*) continue ;;
+            esac
+            if printf '%s' "$dep" | grep -Eq '[><=~]'; then
+                dname=$(printf '%s' "$dep" | sed -E 's/[><=~].*//')
+                dop=$(printf '%s' "$dep" | grep -Eo '[><=~]+' | head -n1)
+                dver=$(printf '%s' "$dep" | sed -E 's/^[^><=~]+[><=~]+//')
+                printf '%s|%s|%s\n' "$dname" "${dop:-=}" "${dver:-any}"
+            else
+                printf '%s|=|any\n' "$dep"
+            fi
+        done
+    fi
+}
+
+# Files owned by a package, absolute paths only.
+get_package_files() {
+    files_pkg="$1"
+    if [ "$PKG_MGR" = "opkg" ]; then
+        opkg files "$files_pkg" 2>/dev/null | grep -E '^/(etc|usr|opt|var)/'
+    else
+        # "apk info -L" prints a "<pkg>-<ver> contains:" header and then paths
+        # relative to /. Drop the header - it is the only line ending in a
+        # colon - before turning the rest into absolute paths.
+        apk info -L "$files_pkg" 2>/dev/null |
+            sed -e '/:[[:space:]]*$/d' -e '/^[[:space:]]*$/d' \
+                -e 's|^/*||' -e 's|^|/|' |
+            grep -E '^/(etc|usr|opt|var)/'
+    fi
+}
+
+# -------------------------------------------------------------
+# 7. Harvesting packages, configs and service state
+# -------------------------------------------------------------
+download_and_inventory_packages() {
+    dest_dir="$1"
+    mkdir -p "$dest_dir/packages" "$dest_dir/configs/tree" "$dest_dir/manifest" || return 1
+
+    : > "$dest_dir/manifest/services.list"
+    : > "$dest_dir/manifest/packages.list"
+    : > "$dest_dir/manifest/configs_map.list"
+    : > "$dest_dir/manifest/dependencies.list"
+
+    pkg_queue="/tmp/obackup_pkg_queue.tmp"
+    pkg_processed="/tmp/obackup_pkg_processed.tmp"
+    origin_map="/tmp/obackup_origin_map.tmp"
+    : > "$pkg_processed"
+
+    # Taken once. Re-reading it per package would run the whole scan hundreds
+    # of times on a router that has hundreds of packages.
+    get_custom_packages > "$origin_map"
+    cut -d'|' -f1 "$origin_map" > "$pkg_queue"
+
+    set_job_status "running" "Working out which packages depend on which..." 15
+
+    # Walk the dependency graph so a package's private libraries travel with it.
+    while [ -s "$pkg_queue" ]; do
+        current_pkg=$(head -n1 "$pkg_queue")
+        sed -i '1d' "$pkg_queue"
+        [ -n "$current_pkg" ] || continue
+        grep -Fxq "$current_pkg" "$pkg_processed" 2>/dev/null && continue
+        printf '%s\n' "$current_pkg" >> "$pkg_processed"
+
+        get_package_dependencies "$current_pkg" > /tmp/obackup_deps.tmp 2>/dev/null
+        while IFS='|' read -r dep_name dep_op dep_ver; do
+            [ -n "$dep_name" ] || continue
+            printf '%s|%s|%s|%s\n' "$current_pkg" "$dep_name" "$dep_op" "$dep_ver" \
+                >> "$dest_dir/manifest/dependencies.list"
+            is_system_package "$dep_name" && continue
+            grep -Fxq "$dep_name" "$pkg_processed" 2>/dev/null && continue
+            printf '%s\n' "$dep_name" >> "$pkg_queue"
+        done < /tmp/obackup_deps.tmp
+        rm -f /tmp/obackup_deps.tmp
+    done
+    rm -f "$pkg_queue"
+
+    total_pkgs=$(wc -l < "$pkg_processed" | tr -d ' ')
+    [ "${total_pkgs:-0}" -gt 0 ] 2>/dev/null || total_pkgs=1
+    current_index=0
+
+    while IFS= read -r pname; do
+        [ -n "$pname" ] || continue
+        current_index=$(( current_index + 1 ))
+
+        pver=$(get_installed_version "$pname")
+        [ -n "$pver" ] || continue
+
+        if [ "$PKG_MGR" = "opkg" ]; then
+            ppkg_sz=$(opkg status "$pname" 2>/dev/null | awk '/^Size: / { print $2; exit }')
+        else
+            ppkg_sz=""
+        fi
+
+        pkind="pkg"
+        is_kmod_package "$pname" && pkind="kmod"
+
+        progress_pct=$(( (current_index * 70) / total_pkgs + 20 ))
+        set_job_status "running" \
+            "Saving $pname ($current_index of $total_pkgs)..." "$progress_pct"
+        log "Processing package: $pname ($pver)"
+
+        artifact_status="MISSING_ARTIFACT"
+        artifact_file=""
+        artifact_sha256=""
+        artifact_arch=""
+
+        # --- Fetch the exact binary so a restore can work without internet ---
+        if [ "$PKG_MGR" = "opkg" ]; then
+            ( cd "$dest_dir/packages" && opkg download "$pname" ) >/dev/null 2>&1
+            found_file=$(find "$dest_dir/packages" -maxdepth 1 \
+                \( -name "${pname}_*.ipk" -o -name "${pname}.ipk" \) 2>/dev/null | head -n1)
+            if [ -n "$found_file" ]; then
+                down_ver=$(extract_ipk_metadata "$found_file" "Version")
+                if [ -n "$down_ver" ] && [ "$down_ver" = "$pver" ]; then
+                    artifact_file=$(basename "$found_file")
+                    artifact_status="EXACT_BINARY_DOWNLOADED"
+                    artifact_arch=$(extract_ipk_metadata "$found_file" "Architecture")
+                else
+                    log "Downloaded ipk for $pname is version ${down_ver:-unknown}, expected $pver - discarded"
+                    rm -f "$found_file"
+                    artifact_status="ONLINE_FEED_ONLY"
+                fi
+            fi
+
+            if [ "$artifact_status" != "EXACT_BINARY_DOWNLOADED" ]; then
+                match=$(find /root /tmp /tmp/upload /etc/custom_packages -maxdepth 2 \
+                    \( -name "${pname}_*.ipk" -o -name "${pname}.ipk" \) 2>/dev/null | head -n1)
+                if [ -n "$match" ]; then
+                    local_ver=$(extract_ipk_metadata "$match" "Version")
+                    if [ -n "$local_ver" ] && [ "$local_ver" = "$pver" ]; then
+                        cp -f "$match" "$dest_dir/packages/"
+                        artifact_file=$(basename "$match")
+                        artifact_status="LOCAL_EXACT_BINARY"
+                        artifact_arch=$(extract_ipk_metadata "$match" "Architecture")
+                    fi
+                fi
+            fi
+        else
+            if command -v apk >/dev/null 2>&1; then
+                apk fetch -o "$dest_dir/packages" "${pname}=${pver}" >/dev/null 2>&1 ||
+                    apk fetch -o "$dest_dir/packages" "$pname" >/dev/null 2>&1
+                found_file=$(find "$dest_dir/packages" -maxdepth 1 \
+                    -name "${pname}-${pver}.apk" 2>/dev/null | head -n1)
+                [ -n "$found_file" ] || found_file=$(find "$dest_dir/packages" -maxdepth 1 \
+                    -name "${pname}-*.apk" 2>/dev/null | head -n1)
+                if [ -n "$found_file" ]; then
+                    if apk_artifact_matches "$pname" "$pver" "$found_file"; then
+                        artifact_file=$(basename "$found_file")
+                        artifact_status="EXACT_BINARY_DOWNLOADED"
+                        artifact_arch=$(extract_apk_metadata "$found_file" "arch")
+                    else
+                        log "Fetched apk for $pname does not match version $pver - discarded"
+                        rm -f "$found_file"
+                        artifact_status="ONLINE_FEED_ONLY"
+                    fi
+                fi
+            fi
+
+            if [ "$artifact_status" != "EXACT_BINARY_DOWNLOADED" ]; then
+                match=$(find /root /tmp /tmp/upload /etc/custom_packages -maxdepth 2 \
+                    -name "${pname}-*.apk" 2>/dev/null | head -n1)
+                if [ -n "$match" ] && apk_artifact_matches "$pname" "$pver" "$match"; then
+                    cp -f "$match" "$dest_dir/packages/"
+                    artifact_file=$(basename "$match")
+                    artifact_status="LOCAL_EXACT_BINARY"
+                    artifact_arch=$(extract_apk_metadata "$match" "arch")
+                fi
+            fi
+        fi
+
+        if [ -n "$artifact_file" ] && [ -f "$dest_dir/packages/$artifact_file" ]; then
+            artifact_sha256=$(sha256sum "$dest_dir/packages/$artifact_file" | awk '{ print $1 }')
+        fi
+
+        # --- Configuration files owned by this package ---
+        pkg_files_tmp="/tmp/obackup_pfiles.tmp"
+        get_package_files "$pname" > "$pkg_files_tmp" 2>/dev/null
+
+        while IFS= read -r cfg_file; do
+            case "$cfg_file" in
+                /etc/config/*) ;;
+                *) continue ;;
+            esac
+            [ -f "$cfg_file" ] || continue
+            rel_dir=$(dirname "$cfg_file" | sed 's|^/||')
+            mkdir -p "$dest_dir/configs/tree/$rel_dir"
+            cp -f "$cfg_file" "$dest_dir/configs/tree/$rel_dir/"
+            printf '%s|%s|%s|uci\n' "$pname" "$pver" "$cfg_file" \
+                >> "$dest_dir/manifest/configs_map.list"
+        done < "$pkg_files_tmp"
+
+        # LuCI apps usually own /etc/config/<name-without-prefix>.
+        for uci_name in "$pname" "${pname#luci-app-}" "${pname#luci-proto-}"; do
+            [ -f "/etc/config/$uci_name" ] || continue
+            grep -Fq "$pname|$pver|/etc/config/$uci_name|" \
+                "$dest_dir/manifest/configs_map.list" 2>/dev/null && continue
+            mkdir -p "$dest_dir/configs/tree/etc/config"
+            cp -f "/etc/config/$uci_name" "$dest_dir/configs/tree/etc/config/"
+            printf '%s|%s|/etc/config/%s|uci\n' "$pname" "$pver" "$uci_name" \
+                >> "$dest_dir/manifest/configs_map.list"
+        done
+
+        # --- Data directories (rule sets, GeoIP databases, profiles) ---
+        dedup_dirs="/tmp/obackup_dedup_dirs.tmp"
+        : > "$dedup_dirs"
+        # The directory that belongs to the package sits one level below the
+        # prefix, and the prefix is one component deep for /etc and /opt but two
+        # for /usr/share and /var/lib. Cutting at a fixed depth would hand back
+        # "/usr/share" itself and sweep in the whole tree.
+        awk -F/ '
+            $2 == "etc" || $2 == "opt" {
+                if (NF >= 4) print "/" $2 "/" $3
+                next
+            }
+            ($2 == "usr" && $3 == "share") || ($2 == "var" && $3 == "lib") {
+                if (NF >= 5) print "/" $2 "/" $3 "/" $4
+            }
+        ' "$pkg_files_tmp" 2>/dev/null >> "$dedup_dirs"
+        for cname in "$pname" "${pname#luci-app-}" "${pname#luci-proto-}"; do
+            for base in /etc /usr/share /opt /var/lib; do
+                [ -d "$base/$cname" ] && printf '%s\n' "$base/$cname" >> "$dedup_dirs"
+            done
+        done
+        rm -f "$pkg_files_tmp"
+
+        sort -u "$dedup_dirs" > "${dedup_dirs}.sorted"
+        while IFS= read -r app_dir; do
+            [ -n "$app_dir" ] || continue
+            case "$app_dir" in
+                /etc|/opt|/usr/share|/var/lib|/usr/lib|\
+                /etc/config|/etc/init.d|/etc/rc.d|/etc/uci-defaults|/etc/opkg|/etc/apk|\
+                /etc/hotplug.d|/etc/dropbear|/etc/ssl|/etc/crontabs|/etc/modules.d|\
+                /usr/share/luci|/usr/share/rpcd|/usr/share/ucode) continue ;;
+            esac
+            [ -d "$app_dir" ] || continue
+            rel_path=$(printf '%s' "$app_dir" | sed 's|^/||')
+            target_sub="$dest_dir/configs/tree/$rel_path"
+            mkdir -p "$target_sub"
+            tar -C "$app_dir" --exclude='*.cache' --exclude='*.tmp' --exclude='*.log' \
+                -cf - . 2>/dev/null | tar -C "$target_sub" -xf - 2>/dev/null
+            printf '%s|%s|%s|dir\n' "$pname" "$pver" "$app_dir" \
+                >> "$dest_dir/manifest/configs_map.list"
+        done < "${dedup_dirs}.sorted"
+        rm -f "$dedup_dirs" "${dedup_dirs}.sorted"
+
+        # --- Which services were running ---
+        for sname in "$pname" "${pname#luci-app-}" "${pname#luci-proto-}"; do
+            [ -x "/etc/init.d/$sname" ] || continue
+            grep -Fq "$pname|$sname|" "$dest_dir/manifest/services.list" 2>/dev/null && continue
+            is_enabled=0
+            "/etc/init.d/$sname" enabled >/dev/null 2>&1 && is_enabled=1
+            printf '%s|%s|%s\n' "$pname" "$sname" "$is_enabled" \
+                >> "$dest_dir/manifest/services.list"
+        done
+
+        porigin=$(awk -F'|' -v p="$pname" '$1 == p { print $5; exit }' "$origin_map")
+        printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+            "$pname" "$pver" "${ppkg_sz:-0}" "${porigin:-dependency}" \
+            "$artifact_status" "$artifact_file" "$artifact_sha256" \
+            "${artifact_arch:-all}" "$pkind" \
+            >> "$dest_dir/manifest/packages.list"
+    done < "$pkg_processed"
+    rm -f "$pkg_processed" "$origin_map"
+
+    # Machine-readable copy of packages.list for anything that wants JSON.
+    json_init
+    json_add_array "packages"
+    while IFS='|' read -r pn pv ps po pa pf psha parch pk; do
+        [ -n "$pn" ] || continue
+        json_add_object ""
+        json_add_string "name" "$pn"
+        json_add_string "version" "$pv"
+        json_add_string "size" "$ps"
+        json_add_string "origin" "$po"
+        json_add_string "artifact_status" "$pa"
+        json_add_string "file" "$pf"
+        json_add_string "sha256" "$psha"
+        json_add_string "arch" "$parch"
+        json_add_string "kind" "$pk"
+        json_close_object
+    done < "$dest_dir/manifest/packages.list"
+    json_close_array
+    json_dump > "$dest_dir/manifest/packages.json"
+}
+
+# -------------------------------------------------------------
+# 8. Standalone recovery runner
+# -------------------------------------------------------------
+create_standalone_recovery_script() {
+    target_base="$1"
+    out_file="$target_base/recovery/restore.sh"
+    mkdir -p "$(dirname "$out_file")"
+
+    cat << 'RESTORE_SCRIPT_EOF' > "$out_file"
+#!/bin/sh
+# Obackup standalone recovery runner 1.0.3
+#
+# Runs without the Obackup package being installed, so it also works on a
+# freshly flashed router where everything except /etc was wiped.
+
+LOG="/var/log/obackup-restore.log"
+REPORT_TXT="/var/log/obackup-restore-report.txt"
+REPORT_JSON="/var/log/obackup-restore-report.json"
+INSTALLED_PKGS="/tmp/obackup_installed_pkgs.tmp"
+EXACT_PKGS="/tmp/obackup_exact_pkgs.tmp"
+
+: > "$INSTALLED_PKGS"
+: > "$EXACT_PKGS"
+
+BASE_DIR=$(cd "$(dirname "$0")/.." && pwd)
+
+logline() { printf '[%s] %s\n' "$(date)" "$1" >> "$LOG"; }
+say() { printf '%s\n' "$1" >> "$REPORT_TXT"; }
+
+FAILURES=0
+WARNINGS=0
+TOTAL_PACKAGES=0
+INSTALLED_OK=0
+
+logline "=== Obackup restore started ==="
+: > "$REPORT_TXT"
+say "=================================================="
+say "                OBACKUP RESTORE REPORT"
+say "=================================================="
+say "Backup location: $BASE_DIR"
+
+# ---- 0. Authenticity and integrity -------------------------------------
+SIG_STATE="not signed"
+if [ -f "$BASE_DIR/manifest/root.sha256.sig" ] && command -v usign >/dev/null 2>&1; then
+    VERIFY_KEY=""
+    TRUST_SOURCE=""
+    if [ -s /etc/obackup/key.pub ]; then
+        VERIFY_KEY="/etc/obackup/key.pub"
+        TRUST_SOURCE="this router's own key"
+    elif [ -s "$BASE_DIR/manifest/key.pub" ]; then
+        VERIFY_KEY="$BASE_DIR/manifest/key.pub"
+        TRUST_SOURCE="the key stored with the backup"
+    fi
+
+    if [ -n "$VERIFY_KEY" ]; then
+        if usign -V -q -m "$BASE_DIR/manifest/root.sha256" \
+                 -p "$VERIFY_KEY" -x "$BASE_DIR/manifest/root.sha256.sig" 2>/dev/null; then
+            SIG_STATE="signature verified against $TRUST_SOURCE"
+        else
+            logline "FATAL: signature check failed against $VERIFY_KEY"
+            say "FATAL: The backup signature does not match $TRUST_SOURCE."
+            say "The backup may have been modified. Nothing was restored."
+            touch /etc/obackup_boot_integrity_failed
+            exit 1
+        fi
+    fi
+fi
+say "Authenticity: $SIG_STATE"
+
+if [ -f "$BASE_DIR/manifest/root.sha256" ]; then
+    if ( cd "$BASE_DIR" && sha256sum -c manifest/root.sha256 ) >/dev/null 2>&1; then
+        say "Integrity:    all files match their checksums"
+    else
+        logline "FATAL: checksum verification failed"
+        say "FATAL: Some backup files are damaged or incomplete. Nothing was restored."
+        touch /etc/obackup_boot_integrity_failed
+        exit 1
+    fi
+fi
+
+# ---- 1. Where the backup came from, where it is going ------------------
+TARGET_PKG_MGR="opkg"
+if command -v apk >/dev/null 2>&1 && [ -d /etc/apk ]; then
+    TARGET_PKG_MGR="apk"
+fi
+
+TARGET_ARCH="unknown"
+TARGET_RELEASE="unknown"
+if [ -f /etc/openwrt_release ]; then
+    . /etc/openwrt_release
+    TARGET_ARCH="$DISTRIB_ARCH"
+    TARGET_RELEASE="$DISTRIB_RELEASE"
+fi
+
+# jshn writes the whole object on a single line, so a line-oriented awk would
+# only ever see the first key. Splitting on commas first makes the same parser
+# work whether the file is one line or pretty-printed.
+read_manifest_field() {
+    mf="$BASE_DIR/manifest/system.json"
+    [ -f "$mf" ] || return 1
+
+    mv_out=""
+    if command -v jsonfilter >/dev/null 2>&1; then
+        mv_out=$(jsonfilter -i "$mf" -e "@.$1" 2>/dev/null)
+    fi
+    if [ -z "$mv_out" ]; then
+        mv_out=$(tr ',' '\n' < "$mf" | awk -F'"' -v k="$1" '$2 == k { print $4; exit }')
+    fi
+
+    printf '%s\n' "$mv_out"
+}
+
+SOURCE_PKG_MGR=$(read_manifest_field pkg_manager)
+SOURCE_ARCH=$(read_manifest_field arch)
+SOURCE_RELEASE=$(read_manifest_field release)
+[ -n "$SOURCE_PKG_MGR" ] || SOURCE_PKG_MGR="opkg"
+[ -n "$SOURCE_ARCH" ] || SOURCE_ARCH="unknown"
+[ -n "$SOURCE_RELEASE" ] || SOURCE_RELEASE="unknown"
+
+# Same firmware generation means the saved binaries are byte-for-byte usable.
+# A different generation means they were built against another kernel and libc,
+# so packages must be reinstalled from the new system's own feeds instead.
+if [ "$SOURCE_RELEASE" = "$TARGET_RELEASE" ] && [ "$SOURCE_PKG_MGR" = "$TARGET_PKG_MGR" ]; then
+    MIGRATION="same"
+else
+    MIGRATION="cross"
+fi
+
+say "From:         OpenWrt $SOURCE_RELEASE ($SOURCE_ARCH, $SOURCE_PKG_MGR)"
+say "To:           OpenWrt $TARGET_RELEASE ($TARGET_ARCH, $TARGET_PKG_MGR)"
+if [ "$MIGRATION" = "same" ]; then
+    say "Mode:         same OpenWrt version - saved package files are reused"
+else
+    say "Mode:         different OpenWrt version - packages are reinstalled from"
+    say "              this system's own feeds, saved files are only a fallback"
+fi
+logline "migration mode: $MIGRATION ($SOURCE_RELEASE -> $TARGET_RELEASE)"
+
+# ---- 2. Extra package feeds -------------------------------------------
+if [ -d "$BASE_DIR/repositories" ]; then
+    if [ -f "$BASE_DIR/repositories/customfeeds.conf" ] && [ -d /etc/opkg ]; then
+        if [ "$MIGRATION" = "cross" ] && [ "$SOURCE_RELEASE" != "unknown" ] &&
+           [ "$TARGET_RELEASE" != "unknown" ]; then
+            # A feed URL usually carries the release number. Point it at the new
+            # release and keep the original as a comment so it can be restored.
+            sed -e "s|^\(.*\)$SOURCE_RELEASE\(.*\)$|# was: \1$SOURCE_RELEASE\2\n\1$TARGET_RELEASE\2|" \
+                "$BASE_DIR/repositories/customfeeds.conf" > /etc/opkg/customfeeds.conf 2>/dev/null ||
+                cp -f "$BASE_DIR/repositories/customfeeds.conf" /etc/opkg/customfeeds.conf 2>/dev/null
+        else
+            cp -f "$BASE_DIR/repositories/customfeeds.conf" /etc/opkg/customfeeds.conf 2>/dev/null
+        fi
+    fi
+
+    if [ -d "$BASE_DIR/repositories/repositories.d" ] && [ -d /etc/apk ]; then
+        mkdir -p /etc/apk/repositories.d
+        for clist in "$BASE_DIR/repositories/repositories.d/"*; do
+            [ -f "$clist" ] || continue
+            # Never overwrite the new system's own official feed list.
+            [ "$(basename "$clist")" = "distfeeds.list" ] && continue
+            cp -f "$clist" /etc/apk/repositories.d/ 2>/dev/null
+        done
+    fi
+fi
+
+# ---- 3. Package installation ------------------------------------------
+say ""
+say "[ PACKAGES ]"
+
+is_arch_compatible() {
+    pkg_arch="$1"
+    target_arch="$2"
+
+    case "$pkg_arch" in
+        ""|all|noarch) return 0 ;;
+    esac
+    case "$target_arch" in
+        ""|unknown) return 0 ;;
+    esac
+    [ "$pkg_arch" = "$target_arch" ] && return 0
+
+    case "$target_arch" in
+        aarch64*|arm64*)   case "$pkg_arch" in aarch64*|arm64*) return 0 ;; esac ;;
+        arm_*|arm)         case "$pkg_arch" in arm_*|arm) return 0 ;; esac ;;
+        mipsel*|mips64el*) case "$pkg_arch" in mipsel*|mips64el*) return 0 ;; esac ;;
+        mips*)             case "$pkg_arch" in mipsel*|mips64el*) return 1 ;; mips*) return 0 ;; esac ;;
+        x86_64|amd64)      case "$pkg_arch" in x86_64|amd64) return 0 ;; esac ;;
+        i386|i486|i586|i686|x86)
+            case "$pkg_arch" in i386|i486|i586|i686|x86) return 0 ;; esac ;;
+    esac
+    return 1
+}
+
+apk_installed_version() {
+    apk list --installed "$1" 2>/dev/null | awk -v p="$1" '
+        {
+            n = length(p)
+            if (substr($1, 1, n + 1) == p "-") {
+                v = substr($1, n + 2)
+                if (v ~ /^[0-9]/) { print v; exit }
+            }
+        }'
+}
+
+installed_version_of() {
+    if [ "$TARGET_PKG_MGR" = "opkg" ]; then
+        opkg status "$1" 2>/dev/null | awk '/^Version: / { print $2; exit }'
+    else
+        apk_installed_version "$1"
+    fi
+}
+
+FEEDS_REFRESHED=0
+refresh_feeds() {
+    [ "$FEEDS_REFRESHED" = "1" ] && return 0
+    FEEDS_REFRESHED=1
+    if [ "$TARGET_PKG_MGR" = "opkg" ]; then
+        opkg update >> "$LOG" 2>&1
+    else
+        apk update >> "$LOG" 2>&1
+    fi
+    return 0
+}
+
+install_from_artifact() {
+    a_name="$1"; a_ver="$2"; a_file="$3"; a_sha="$4"; a_arch="$5"
+    [ -n "$a_file" ] || return 1
+    art="$BASE_DIR/packages/$a_file"
+    [ -f "$art" ] || return 1
+
+    if [ -z "$a_sha" ]; then
+        logline "no checksum recorded for $a_file - refusing to install it"
+        return 1
+    fi
+    if [ "$(sha256sum "$art" | awk '{ print $1 }')" != "$a_sha" ]; then
+        logline "checksum mismatch for $a_file - refusing to install it"
+        return 1
+    fi
+    if ! is_arch_compatible "$a_arch" "$TARGET_ARCH"; then
+        logline "$a_file is built for $a_arch, this router is $TARGET_ARCH - skipped"
+        return 1
+    fi
+
+    case "$a_file" in
+        *.ipk)
+            [ "$TARGET_PKG_MGR" = "opkg" ] || return 1
+            opkg install "$art" >> "$LOG" 2>&1 ;;
+        *.apk)
+            [ "$TARGET_PKG_MGR" = "apk" ] || return 1
+            # apk-tools 3 refuses a package that is not in a configured
+            # repository ("it would be lost on next reboot", exit 99), which is
+            # exactly what a saved file is. Older apk builds do not know the
+            # flag, hence the retry without it.
+            apk add --allow-untrusted --force-non-repository "$art" >> "$LOG" 2>&1 ||
+                apk add --allow-untrusted "$art" >> "$LOG" 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
+# On a different OpenWrt version a compiled package from the old firmware is
+# linked against the old libc and built for the old kernel. Only
+# architecture-independent packages - scripts and LuCI apps - can be reused.
+artifact_safe_across_versions() {
+    case "$1" in
+        all|noarch|"") return 0 ;;
+    esac
+    return 1
+}
+
+install_from_feed() {
+    f_name="$1"; f_ver="$2"
+    refresh_feeds
+    if [ "$TARGET_PKG_MGR" = "opkg" ]; then
+        if [ "$MIGRATION" = "same" ] && opkg install "${f_name}=${f_ver}" >> "$LOG" 2>&1; then
+            return 0
+        fi
+        opkg install "$f_name" >> "$LOG" 2>&1
+    else
+        if [ "$MIGRATION" = "same" ] && apk add "${f_name}=${f_ver}" >> "$LOG" 2>&1; then
+            return 0
+        fi
+        apk add "$f_name" >> "$LOG" 2>&1
+    fi
+}
+
+if [ -f "$BASE_DIR/manifest/packages.list" ]; then
+    while IFS='|' read -r pname pver psize porigin pstatus pfile psha parch pkind; do
+        [ -n "$pname" ] || continue
+        TOTAL_PACKAGES=$(( TOTAL_PACKAGES + 1 ))
+
+        # Kernel modules are tied to one exact kernel build. On a different
+        # OpenWrt version the new firmware already ships its own set.
+        if [ "$pkind" = "kmod" ] && [ "$MIGRATION" = "cross" ]; then
+            say "  - $pname : skipped (kernel module, supplied by the new firmware)"
+            continue
+        fi
+
+        if [ "$(installed_version_of "$pname")" = "$pver" ]; then
+            say "  OK $pname ($pver) : already present"
+            INSTALLED_OK=$(( INSTALLED_OK + 1 ))
+            printf '%s\n' "$pname" >> "$INSTALLED_PKGS"
+            printf '%s\n' "$pname" >> "$EXACT_PKGS"
+            continue
+        fi
+
+        install_method="none"
+        if [ "$MIGRATION" = "same" ]; then
+            if install_from_artifact "$pname" "$pver" "$pfile" "$psha" "$parch"; then
+                install_method="saved"
+            elif install_from_feed "$pname" "$pver"; then
+                install_method="feed"
+            fi
+        else
+            if install_from_feed "$pname" "$pver"; then
+                install_method="feed"
+            elif artifact_safe_across_versions "$parch" &&
+                 install_from_artifact "$pname" "$pver" "$pfile" "$psha" "$parch"; then
+                install_method="saved-old"
+            fi
+        fi
+
+        inst_ver=$(installed_version_of "$pname")
+
+        if [ -z "$inst_ver" ]; then
+            if [ "$MIGRATION" = "cross" ] && ! artifact_safe_across_versions "$parch"; then
+                say "  FAIL $pname : no build available for OpenWrt $TARGET_RELEASE."
+                say "       The saved file was compiled for OpenWrt $SOURCE_RELEASE and would"
+                say "       not run here, so it was not installed. Add a package list that"
+                say "       carries this package, then press Restore again."
+            else
+                say "  FAIL $pname ($pver) : could not be installed"
+            fi
+            FAILURES=$(( FAILURES + 1 ))
+            continue
+        fi
+
+        printf '%s\n' "$pname" >> "$INSTALLED_PKGS"
+        INSTALLED_OK=$(( INSTALLED_OK + 1 ))
+
+        if [ "$inst_ver" = "$pver" ]; then
+            printf '%s\n' "$pname" >> "$EXACT_PKGS"
+            say "  OK $pname ($inst_ver) : installed"
+        elif [ "$install_method" = "saved-old" ]; then
+            say "  WARN $pname ($inst_ver) : installed from the saved file, which came from"
+            say "       OpenWrt $SOURCE_RELEASE. Check that it still works."
+            WARNINGS=$(( WARNINGS + 1 ))
+        elif [ "$MIGRATION" = "cross" ]; then
+            say "  OK $pname ($inst_ver) : the OpenWrt $TARGET_RELEASE build, backup had $pver"
+        else
+            say "  WARN $pname ($inst_ver) : installed, but the backup had $pver"
+            WARNINGS=$(( WARNINGS + 1 ))
+        fi
+    done < "$BASE_DIR/manifest/packages.list"
+fi
+
+# ---- 4. Configuration files -------------------------------------------
+say ""
+say "[ SETTINGS ]"
+
+RESTORED_PATHS="/tmp/obackup_restored_paths.tmp"
+: > "$RESTORED_PATHS"
+
+# Keep whatever the fresh install put there, once, so a bad restore can be
+# undone by hand.
+keep_original() {
+    orig_path="$1"
+    [ -e "$orig_path" ] || return 0
+    [ -e "$orig_path.obackup-orig" ] && return 0
+    cp -a "$orig_path" "$orig_path.obackup-orig" 2>/dev/null
+}
+
+if [ -f "$BASE_DIR/manifest/configs_map.list" ]; then
+    while IFS='|' read -r owner_pkg owner_ver dest_path cfg_type; do
+        [ -n "$dest_path" ] || continue
+
+        if ! grep -Fxq "$owner_pkg" "$INSTALLED_PKGS" 2>/dev/null; then
+            say "  - $dest_path : skipped ($owner_pkg is not installed)"
+            continue
+        fi
+
+        source_item="$BASE_DIR/configs/tree/$(printf '%s' "$dest_path" | sed 's|^/||')"
+
+        version_note=""
+        if ! grep -Fxq "$owner_pkg" "$EXACT_PKGS" 2>/dev/null; then
+            version_note=" (from $owner_pkg $owner_ver; a copy of the new default was kept as .obackup-orig)"
+        fi
+
+        if grep -Fxq "$dest_path" "$RESTORED_PATHS" 2>/dev/null; then
+            say "  ! $dest_path : written again by $owner_pkg"
+        fi
+        printf '%s\n' "$dest_path" >> "$RESTORED_PATHS"
+
+        if [ "$cfg_type" = "uci" ] && [ -f "$source_item" ]; then
+            keep_original "$dest_path"
+            mkdir -p "$(dirname "$dest_path")"
+            cp -f "$source_item" "$dest_path"
+            cname=$(basename "$dest_path")
+            if uci -q show "$cname" >/dev/null 2>&1; then
+                say "  OK $dest_path : restored$version_note"
+            else
+                say "  WARN $dest_path : restored but UCI cannot read it$version_note"
+                WARNINGS=$(( WARNINGS + 1 ))
+            fi
+        elif [ "$cfg_type" = "dir" ] && [ -d "$source_item" ]; then
+            keep_original "$dest_path"
+            mkdir -p "$dest_path"
+            tar -C "$source_item" -cf - . 2>/dev/null | tar -C "$dest_path" -xf - 2>/dev/null
+            say "  OK $dest_path : data files restored$version_note"
+        fi
+    done < "$BASE_DIR/manifest/configs_map.list"
+fi
+rm -f "$RESTORED_PATHS"
+
+# ---- 5. Services -------------------------------------------------------
+say ""
+say "[ SERVICES ]"
+
+if [ -f "$BASE_DIR/manifest/services.list" ]; then
+    while IFS='|' read -r spkg ssvc senabled; do
+        [ -n "$ssvc" ] || continue
+        [ -x "/etc/init.d/$ssvc" ] || continue
+
+        if [ "$senabled" != "1" ]; then
+            "/etc/init.d/$ssvc" disable >/dev/null 2>&1
+            say "  OK $ssvc : left disabled, as it was before"
+            continue
+        fi
+
+        if ! grep -Fxq "$spkg" "$INSTALLED_PKGS" 2>/dev/null; then
+            say "  - $ssvc : not started ($spkg is not installed)"
+            continue
+        fi
+
+        "/etc/init.d/$ssvc" enable >/dev/null 2>&1
+        if "/etc/init.d/$ssvc" restart >> "$LOG" 2>&1; then
+            say "  OK $ssvc : enabled and started"
+        else
+            say "  WARN $ssvc : enabled, but it did not start - check its settings"
+            WARNINGS=$(( WARNINGS + 1 ))
+        fi
+    done < "$BASE_DIR/manifest/services.list"
+fi
+
+# ---- 6. Summary --------------------------------------------------------
+printf '{"total_packages":%d,"installed_ok":%d,"failures":%d,"warnings":%d,"migration":"%s","timestamp":%d}\n' \
+    "$TOTAL_PACKAGES" "$INSTALLED_OK" "$FAILURES" "$WARNINGS" "$MIGRATION" "$(date +%s)" > "$REPORT_JSON"
+
+rm -f "$INSTALLED_PKGS" "$EXACT_PKGS"
+
+say ""
+say "=================================================="
+say "$INSTALLED_OK of $TOTAL_PACKAGES packages are in place."
+if [ "$FAILURES" -eq 0 ] && [ "$WARNINGS" -eq 0 ]; then
+    say "Everything was restored."
+    say "=================================================="
+    logline "=== restore finished: complete ==="
+    rm -f "$BASE_DIR/recovery/.restore_failed"
+    exit 0
+elif [ "$FAILURES" -eq 0 ]; then
+    say "Restored, with $WARNINGS thing(s) worth checking above."
+    say "=================================================="
+    logline "=== restore finished: complete with warnings ==="
+    rm -f "$BASE_DIR/recovery/.restore_failed"
+    exit 0
+else
+    say "$FAILURES package(s) could not be installed. Details are in $LOG."
+    say "If this router has no internet yet, connect it and press Restore again."
+    say "=================================================="
+    logline "=== restore finished: partial ($FAILURES failures) ==="
+    touch "$BASE_DIR/recovery/.restore_failed"
+    exit 2
+fi
+RESTORE_SCRIPT_EOF
+
+    chmod 0755 "$out_file"
+}
+
+# The checksum file must not list itself: it is still empty while the hashes
+# are being computed, so including it guarantees a mismatch at restore time.
+seal_backup_tree() {
+    seal_base="$1"
+    ( cd "$seal_base" && find manifest configs packages recovery -type f \
+        ! -name 'root.sha256' ! -name 'root.sha256.sig' 2>/dev/null |
+        sort | xargs sha256sum ) > "$seal_base/manifest/root.sha256" 2>/dev/null
+}
+
+# -------------------------------------------------------------
+# 9. Backup signing
+# -------------------------------------------------------------
+# The private key lives on the router and is preserved across sysupgrade, so a
+# backup that was tampered with on a USB stick fails verification on the way
+# back in.
+ensure_keypair() {
+    mkdir -p "$KEY_DIR" 2>/dev/null
+    chmod 0700 "$KEY_DIR" 2>/dev/null
+
+    if [ -s "$KEY_SEC" ] && [ -s "$KEY_PUB" ]; then
+        return 0
+    fi
+    command -v usign >/dev/null 2>&1 || return 1
+
+    rm -f "$KEY_SEC" "$KEY_PUB"
+    usign -G -s "$KEY_SEC" -p "$KEY_PUB" >/dev/null 2>&1 || return 1
+    chmod 0600 "$KEY_SEC" 2>/dev/null
+    chmod 0644 "$KEY_PUB" 2>/dev/null
+    log "Generated a new signing key pair in $KEY_DIR"
+    return 0
+}
+
+sign_backup_tree() {
+    sign_base="$1"
+    ensure_keypair || {
+        log "No signing key available - the backup will not be signed"
+        return 1
+    }
+    usign -S -m "$sign_base/manifest/root.sha256" \
+             -s "$KEY_SEC" -x "$sign_base/manifest/root.sha256.sig" >/dev/null 2>&1 || {
+        log "Signing failed"
+        rm -f "$sign_base/manifest/root.sha256.sig"
+        return 1
+    }
+    cp -f "$KEY_PUB" "$sign_base/manifest/key.pub" 2>/dev/null
+    return 0
+}
+
+# -------------------------------------------------------------
+# 10. Boot-time restore hooks
+# -------------------------------------------------------------
+# uci-defaults runs very early, before the network is up, so it cannot install
+# anything from a feed. It therefore only arms a normal init script, which
+# waits for storage and for a working connection before doing the real work.
+install_boot_hooks() {
+    mkdir -p /usr/lib/obackup 2>/dev/null
+    touch "$OVERLAY_SENTINEL" 2>/dev/null
+
+    cat << 'INIT_SCRIPT_EOF' > /etc/init.d/obackup-restore
+#!/bin/sh /etc/rc.common
+# Obackup post-upgrade restore 1.0.3
+
+START=99
+STOP=01
+
+SENTINEL="/usr/lib/obackup/overlay-intact"
+RUN_LOCK="/var/run/obackup-boot-restore.lockdir"
+BOOT_LOG="/var/log/obackup-boot-restore.log"
+
+find_runner() {
+    for candidate in /etc/obackup_storage /mnt/*/obackup_storage /media/*/obackup_storage; do
+        if [ -x "$candidate/recovery/restore.sh" ]; then
+            printf '%s\n' "$candidate/recovery/restore.sh"
+            return 0
+        fi
+    done
+    return 1
+}
+
+have_default_route() {
+    # 00000000 in the destination column is the default route.
+    awk 'NR > 1 && $2 == "00000000" { found = 1 } END { exit found ? 0 : 1 }' /proc/net/route 2>/dev/null
+}
+
+# Only a firmware upgrade should trigger a restore. /usr is wiped by sysupgrade
+# and is not preserved, so the sentinel is missing exactly once: on the first
+# boot of the new firmware. On an ordinary reboot it is still there and the
+# current settings must not be touched.
+should_restore() {
+    [ -f /etc/obackup_restore_pending ] || return 1
+    [ -f "$SENTINEL" ] && return 1
+    return 0
+}
+
+mark_done() {
+    mkdir -p /usr/lib/obackup 2>/dev/null
+    touch "$SENTINEL" 2>/dev/null
+}
+
+run_restore() {
+    should_restore || return 0
+
+    # The uci-defaults trigger and this service can both fire on the same boot.
+    # mkdir is atomic, so only one of them proceeds.
+    mkdir "$RUN_LOCK" 2>/dev/null || return 0
+    trap 'rm -rf "$RUN_LOCK"' EXIT INT TERM
+
+    runner=""
+    # Up to 60 seconds for a USB disk to be detected and mounted.
+    i=0
+    while [ "$i" -lt 30 ]; do
+        command -v block >/dev/null 2>&1 && block mount >/dev/null 2>&1
+        runner=$(find_runner) && break
+        i=$(( i + 1 ))
+        sleep 2
+    done
+
+    if [ -z "$runner" ]; then
+        printf '[%s] No backup storage found after 60 seconds.\n' "$(date)" >> "$BOOT_LOG"
+        touch /etc/obackup_storage_not_found
+        rm -rf "$RUN_LOCK"
+        return 1
+    fi
+
+    # Up to 90 seconds for the connection to come up, so packages can be
+    # downloaded. Restoring offline still works, it just cannot reach a feed.
+    i=0
+    while [ "$i" -lt 45 ]; do
+        have_default_route && break
+        i=$(( i + 1 ))
+        sleep 2
+    done
+
+    "$runner" >> "$BOOT_LOG" 2>&1
+    ret=$?
+
+    if [ "$ret" -eq 0 ]; then
+        rm -f /etc/obackup_restore_pending /etc/obackup_boot_attempts
+        mark_done
+    else
+        # Counted so a restore that can never succeed does not retry forever.
+        attempts=$(cat /etc/obackup_boot_attempts 2>/dev/null)
+        attempts=$(( ${attempts:-0} + 1 ))
+        printf '%s\n' "$attempts" > /etc/obackup_boot_attempts
+        if [ "$attempts" -ge 3 ]; then
+            printf '[%s] Giving up after %s attempts.\n' "$(date)" "$attempts" >> "$BOOT_LOG"
+            rm -f /etc/obackup_restore_pending
+            mark_done
+        fi
+    fi
+
+    rm -rf "$RUN_LOCK"
+    return "$ret"
+}
+
+boot() {
+    # Detached, so a slow restore never holds up the rest of the boot.
+    run_restore >/dev/null 2>&1 &
+}
+
+start() {
+    run_restore
+}
+
+stop() {
+    return 0
+}
+INIT_SCRIPT_EOF
+    chmod 0755 /etc/init.d/obackup-restore
+
+    cat << 'BOOT_HOOK_EOF' > /etc/uci-defaults/99-obackup-restore
+#!/bin/sh
+# Obackup first-boot trigger.
+#
+# The restore itself is done by /etc/init.d/obackup-restore, which normally
+# survives the upgrade through /etc/sysupgrade.conf. This only covers the case
+# where its rc.d link did not survive: the boot sequence has already read that
+# directory by now, so the service is started here instead.
+
+if [ -x /etc/init.d/obackup-restore ]; then
+    if [ ! -e /etc/rc.d/S99obackup-restore ]; then
+        /etc/init.d/obackup-restore enable >/dev/null 2>&1
+        /etc/init.d/obackup-restore start >/dev/null 2>&1 &
+    fi
+fi
+
+exit 0
+BOOT_HOOK_EOF
+    chmod 0755 /etc/uci-defaults/99-obackup-restore
+
+    touch /etc/obackup_restore_pending
+    rm -f /etc/obackup_boot_attempts /etc/obackup_storage_not_found \
+          /etc/obackup_boot_integrity_failed
+    /etc/init.d/obackup-restore enable >/dev/null 2>&1
+}
+# Everything below /etc survives sysupgrade only when it is listed here.
+register_sysupgrade_paths() {
+    keep_target="$1"
+    touch /etc/sysupgrade.conf
+
+    for preserve in \
+        /etc/uci-defaults/99-obackup-restore \
+        /etc/init.d/obackup-restore \
+        /etc/rc.d/S99obackup-restore \
+        /etc/obackup_restore_pending \
+        /etc/obackup_boot_attempts \
+        "$TARGET_PATH_FILE" \
+        "$KEY_DIR" \
+        "$keep_target"
+    do
+        case "$preserve" in
+            /etc/*) ;;
+            *) continue ;;
+        esac
+        grep -Fxq "$preserve" /etc/sysupgrade.conf 2>/dev/null && continue
+        printf '%s\n' "$preserve" >> /etc/sysupgrade.conf
+    done
+}
+
+# -------------------------------------------------------------
+# 11. Backup
+# -------------------------------------------------------------
+do_backup() {
+    set_job_status "running" "Checking how much space is needed..." 5
+    log "Backup started (OpenWrt $SYS_RELEASE, $PKG_MGR)"
+    rm -f "$CACHE_INVENTORY" "$CACHE_HASH_FILE" "$APK_INSTALLED_CACHE"
+
+    final_dir=$(get_target_dir)
+    if [ "$final_dir" = "ERR_NO_SPACE" ]; then
+        log "Not enough free space on internal storage or on any USB disk"
+        set_job_status "failed" "Not enough free space. Plug in a USB disk and try again." 100
+        echo "ERR_NO_SPACE"
+        return 1
+    fi
+    if ! validate_target_dir "$final_dir"; then
+        log "Refusing to use unexpected target path: $final_dir"
+        set_job_status "failed" "Internal error: unsafe storage path" 100
+        echo "ERR_INVALID_PATH"
+        return 1
+    fi
+
+    # Build beside the existing backup and swap at the end, so a failed run
+    # never leaves the router without the previous one.
+    work_dir="$final_dir.new"
+    old_dir="$final_dir.old"
+    validate_target_dir "$work_dir" || { echo "ERR_INVALID_PATH"; return 1; }
+
+    set_job_status "running" "Preparing $final_dir..." 10
+    rm -rf "$work_dir" "$old_dir"
+    mkdir -p "$work_dir/manifest" "$work_dir/packages" "$work_dir/configs" \
+             "$work_dir/repositories" "$work_dir/recovery" || {
+        set_job_status "failed" "Could not create $work_dir" 100
+        echo "ERR_MKDIR_FAILED"
+        return 1
+    }
+
+    get_sys_info_json > "$work_dir/manifest/system.json"
+
+    [ -f /etc/opkg/customfeeds.conf ] && cp -f /etc/opkg/customfeeds.conf "$work_dir/repositories/" 2>/dev/null
+    [ -d /etc/apk/repositories.d ] && cp -rf /etc/apk/repositories.d "$work_dir/repositories/" 2>/dev/null
+
+    download_and_inventory_packages "$work_dir" || {
+        log "Collecting packages failed"
+        rm -rf "$work_dir"
+        set_job_status "failed" "Collecting packages failed - see $LOG_FILE" 100
+        echo "ERR_HARVEST_FAILED"
+        return 1
+    }
+
+    set_job_status "running" "Writing the recovery script..." 92
+    create_standalone_recovery_script "$work_dir"
+
+    set_job_status "running" "Checksumming and signing..." 94
+    seal_backup_tree "$work_dir"
+    sign_backup_tree "$work_dir"
+
+    # The bundle is a second, compressed copy of everything, meant for carrying
+    # the backup off the router as one file. On the router's own flash that
+    # roughly doubles the space used for no benefit, and flash is exactly where
+    # space is scarce, so it is only written to removable storage.
+    case "$final_dir" in
+        /etc/obackup_storage)
+            log "Backup is on internal flash; skipping the single-file bundle to save space"
+            ;;
+        *)
+            set_job_status "running" "Packing the archive..." 96
+            bundle="$work_dir/obackup-bundle-latest.tar.gz"
+            if ! tar -czf "$bundle" -C "$work_dir" manifest configs packages repositories recovery 2>/dev/null; then
+                log "Could not create the archive"
+                rm -rf "$work_dir"
+                set_job_status "failed" "Could not create the archive" 100
+                echo "ERR_TAR_FAILED"
+                return 1
+            fi
+            if ! tar -tzf "$bundle" >/dev/null 2>&1; then
+                log "The archive is damaged"
+                rm -rf "$work_dir"
+                set_job_status "failed" "The archive did not verify" 100
+                echo "ERR_ARCHIVE_CORRUPTED"
+                return 1
+            fi
+            ;;
+    esac
+
+    set_job_status "running" "Putting everything in place..." 98
+    if [ -d "$final_dir" ]; then
+        mv "$final_dir" "$old_dir" 2>/dev/null
+    fi
+    if ! mv "$work_dir" "$final_dir" 2>/dev/null; then
+        [ -d "$old_dir" ] && mv "$old_dir" "$final_dir" 2>/dev/null
+        log "Could not move the new backup into place"
+        set_job_status "failed" "Could not move the new backup into place" 100
+        echo "ERR_SWAP_FAILED"
+        return 1
+    fi
+    rm -rf "$old_dir"
+
+    printf '%s\n' "$final_dir" > "$TARGET_PATH_FILE" 2>/dev/null
+
+    install_boot_hooks
+    case "$final_dir" in
+        /etc/*) register_sysupgrade_paths "$final_dir" ;;
+        *)      register_sysupgrade_paths "" ;;
+    esac
+
+    if grep -Eq '\|(MISSING_ARTIFACT|ONLINE_FEED_ONLY)\|' "$final_dir/manifest/packages.list" 2>/dev/null; then
+        log "Backup finished at $final_dir, some package files could not be downloaded"
+        set_job_status "warning" "PARTIAL:$final_dir" 100
+        echo "PARTIAL:$final_dir"
+        return 0
+    fi
+
+    log "Backup finished at $final_dir"
+    set_job_status "success" "SUCCESS:$final_dir" 100
+    echo "SUCCESS:$final_dir"
+    return 0
+}
+
+# -------------------------------------------------------------
+# 12. Manual restore
+# -------------------------------------------------------------
+do_restore() {
+    set_job_status "running" "Looking for a backup..." 10
+
+    runner=""
+    for mnt in /etc/obackup_storage /mnt/*/obackup_storage /media/*/obackup_storage; do
+        if [ -x "$mnt/recovery/restore.sh" ]; then
+            runner="$mnt/recovery/restore.sh"
+            break
+        fi
+    done
+
+    if [ -z "$runner" ]; then
+        log "No backup found to restore"
+        set_job_status "failed" "No backup found. Create one first, or plug in the USB disk that holds it." 100
+        echo "ERR_NOT_FOUND"
+        return 1
+    fi
+
+    set_job_status "running" "Restoring packages and settings..." 30
+    log "Running $runner"
+    "$runner"
+    ret=$?
+
+    case "$ret" in
+        0)
+            set_job_status "success" "SUCCESS" 100
+            echo "SUCCESS"
+            return 0 ;;
+        2)
+            set_job_status "warning" "WARNING_PARTIAL" 100
+            echo "WARNING_PARTIAL"
+            return 2 ;;
+        *)
+            set_job_status "failed" "ERR_RESTORE_FAILED" 100
+            echo "ERR_RESTORE_FAILED"
+            return 1 ;;
+    esac
+}
+
+# -------------------------------------------------------------
+# 13. Removing a backup
+# -------------------------------------------------------------
+# Frees the space again once an upgrade has been restored. Only ever touches a
+# path that validate_target_dir recognises, so a stale or empty variable can
+# never turn this into a wider delete.
+do_delete_backup() {
+    del_dir=$(find_backup_dir)
+    if [ -z "$del_dir" ]; then
+        echo "ERR_NOT_FOUND"
+        return 1
+    fi
+    if ! validate_target_dir "$del_dir"; then
+        log "Refusing to delete unexpected path: $del_dir"
+        echo "ERR_INVALID_PATH"
+        return 1
+    fi
+
+    freed_kb=$(du -sk "$del_dir" 2>/dev/null | awk '{ print $1 }')
+    log "Deleting backup at $del_dir (${freed_kb:-0} KB)"
+
+    rm -rf "$del_dir"
+    for leftover in "$del_dir.new" "$del_dir.old"; do
+        validate_target_dir "$leftover" && rm -rf "$leftover"
+    done
+
+    # With no backup left there is nothing for the boot hook to restore.
+    [ -x /etc/init.d/obackup-restore ] && /etc/init.d/obackup-restore disable >/dev/null 2>&1
+    rm -f /etc/init.d/obackup-restore \
+          /etc/rc.d/S99obackup-restore \
+          /etc/uci-defaults/99-obackup-restore \
+          /etc/obackup_restore_pending \
+          /etc/obackup_boot_attempts \
+          /etc/obackup_storage_not_found \
+          /etc/obackup_boot_integrity_failed \
+          "$TARGET_PATH_FILE"
+
+    # Stop preserving those paths across sysupgrade. The signing key entry is
+    # deliberately left in place: it is tiny, and losing it would make any copy
+    # of a backup kept elsewhere unverifiable.
+    if [ -f /etc/sysupgrade.conf ]; then
+        drop_list="/tmp/obackup_drop.tmp"
+        printf '%s\n' \
+            /etc/uci-defaults/99-obackup-restore \
+            /etc/init.d/obackup-restore \
+            /etc/rc.d/S99obackup-restore \
+            /etc/obackup_restore_pending \
+            /etc/obackup_boot_attempts \
+            "$TARGET_PATH_FILE" \
+            /etc/obackup_storage > "$drop_list"
+        if grep -vxF -f "$drop_list" /etc/sysupgrade.conf > /tmp/obackup_sysupgrade.tmp 2>/dev/null; then
+            mv /tmp/obackup_sysupgrade.tmp /etc/sysupgrade.conf
+        fi
+        rm -f "$drop_list" /tmp/obackup_sysupgrade.tmp
+    fi
+
+    rm -f "$CACHE_INVENTORY" "$CACHE_HASH_FILE" "$APK_INSTALLED_CACHE"
+
+    log "Backup deleted, ${freed_kb:-0} KB freed"
+    echo "DELETED:${freed_kb:-0}"
+    return 0
+}
+
+# -------------------------------------------------------------
+# 14. Background job dispatcher
+# -------------------------------------------------------------
+proc_start_time() {
+    # Field 22 of /proc/<pid>/stat, counted after the ")" that closes the
+    # process name, which may itself contain spaces.
+    sed -n 's/^[0-9]* ([^)]*) //p' "/proc/$1/stat" 2>/dev/null | awk '{ print $20 }'
+}
+
+start_async_job() {
+    job_type="$1"
+
+    if [ -d "$LOCK_DIR" ]; then
+        lock_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+        lock_start=$(cat "$LOCK_DIR/starttime" 2>/dev/null)
+
+        if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+            curr_start=$(proc_start_time "$lock_pid")
+            # Matching start time proves it is still the same process and not a
+            # new one that happened to be given the recycled pid.
+            if [ -n "$lock_start" ] && [ "$curr_start" = "$lock_start" ]; then
+                echo "JOB_ALREADY_RUNNING"
+                return 1
+            fi
+        fi
+        rm -rf "$LOCK_DIR"
+    fi
+
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo "JOB_ALREADY_RUNNING"
+        return 1
+    fi
+    printf '%s\n' "$job_type" > "$LOCK_DIR/type"
+
+    set_job_status "running" "Starting..." 0
+
+    # Every descriptor is redirected on the subshell itself. Redirecting only
+    # the inner command would leave rpcd's stdout pipe open, and the ubus call
+    # would block until the whole backup finished.
+    (
+        trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+        case "$job_type" in
+            backup)  do_backup ;;
+            restore) do_restore ;;
+        esac
+    ) </dev/null >/dev/null 2>&1 &
+
+    job_pid=$!
+    printf '%s\n' "$job_pid" > "$LOCK_DIR/pid" 2>/dev/null
+    proc_start_time "$job_pid" > "$LOCK_DIR/starttime" 2>/dev/null
+
+    echo "JOB_STARTED"
+    return 0
+}
+
+case "$1" in
+    backup)        do_backup ;;
+    restore)       do_restore ;;
+    start-backup)  start_async_job "backup" ;;
+    start-restore) start_async_job "restore" ;;
+    job-status)
+        if [ -f "$JOB_STATUS_FILE" ]; then
+            cat "$JOB_STATUS_FILE"
+        else
+            echo '{"state":"idle","message":"Nothing is running","progress":0}'
+        fi
+        ;;
+    list-custom)   get_custom_packages ;;
+    backup-info)   get_backup_info_json ;;
+    delete-backup) do_delete_backup ;;
+    status)
+        printf 'PkgMgr:%s\n' "$PKG_MGR"
+        printf 'Target:%s\n' "$(get_fast_target_dir)"
+        printf 'Release:%s\n' "$SYS_RELEASE"
+        printf 'Arch:%s\n' "$SYS_ARCH"
+        printf 'Version:%s\n' "$OBACKUP_VERSION"
+        ;;
+    sysinfo)       get_sys_info_json ;;
+    version)       printf '%s\n' "$OBACKUP_VERSION" ;;
+    *)
+        echo "Usage: $0 {backup|restore|start-backup|start-restore|job-status|list-custom|backup-info|delete-backup|status|sysinfo|version}"
+        exit 1
+        ;;
+esac

@@ -1,0 +1,129 @@
+#!/bin/sh
+
+. /usr/share/libubox/jshn.sh
+
+OBACKUP=/usr/bin/obackup
+REPORT_FILE="/var/log/obackup-restore-report.txt"
+
+# "PkgMgr:opkg" -> opkg. Splitting on the first colon only, because values such
+# as a storage path may contain colons of their own.
+status_field() {
+    printf '%s\n' "$1" | sed -n "s/^$2://p" | head -n1
+}
+
+case "$1" in
+    list)
+        echo '{ "status": {}, "scan": {}, "backup_info": {}, "start_backup": {}, "delete_backup": {}, "start_restore": {}, "job_status": {}, "report": {} }'
+        ;;
+
+    call)
+        case "$2" in
+            status)
+                STATUS_OUT=$("$OBACKUP" status 2>/dev/null)
+
+                json_init
+                json_add_string "pkg_mgr" "$(status_field "$STATUS_OUT" PkgMgr)"
+                json_add_string "target"  "$(status_field "$STATUS_OUT" Target)"
+                json_add_string "release" "$(status_field "$STATUS_OUT" Release)"
+                json_add_string "arch"    "$(status_field "$STATUS_OUT" Arch)"
+                json_add_string "version" "$(status_field "$STATUS_OUT" Version)"
+                json_dump
+                ;;
+
+            backup_info)
+                BI_OUT=$("$OBACKUP" backup-info 2>/dev/null)
+                case "$BI_OUT" in
+                    \{*) printf '%s\n' "$BI_OUT" ;;
+                    *)   echo '{"exists":false}' ;;
+                esac
+                ;;
+
+            scan)
+                json_init
+                json_add_array "packages"
+
+                TMP_SCAN=$(mktemp /tmp/obackup-scan.XXXXXX)
+                "$OBACKUP" list-custom 2>/dev/null > "$TMP_SCAN"
+
+                while IFS='|' read -r pname pver psize _pinst porigin; do
+                    [ -n "$pname" ] || continue
+
+                    json_add_object ""
+                    json_add_string "name" "$pname"
+                    json_add_string "version" "$pver"
+                    case "$psize" in
+                        ''|*[!0-9]*) json_add_int "size" 0 ;;
+                        *)           json_add_int "size" "$psize" ;;
+                    esac
+                    json_add_string "origin" "$porigin"
+                    json_close_object
+                done < "$TMP_SCAN"
+
+                rm -f "$TMP_SCAN"
+                json_close_array
+                json_dump
+                ;;
+
+            start_backup)
+                RES=$("$OBACKUP" start-backup 2>/dev/null)
+                RC=$?
+                json_init
+                json_add_string "result" "$RES"
+                [ "$RC" -ne 0 ] && json_add_string "error" "obackup exited with code $RC"
+                json_dump
+                ;;
+
+            start_restore)
+                RES=$("$OBACKUP" start-restore 2>/dev/null)
+                RC=$?
+                json_init
+                json_add_string "result" "$RES"
+                [ "$RC" -ne 0 ] && json_add_string "error" "obackup exited with code $RC"
+                json_dump
+                ;;
+
+            delete_backup)
+                RES=$("$OBACKUP" delete-backup 2>/dev/null)
+                RC=$?
+                json_init
+                json_add_string "result" "$RES"
+                [ "$RC" -ne 0 ] && json_add_string "error" "obackup exited with code $RC"
+                json_dump
+                ;;
+
+            job_status)
+                JOB_OUT=$("$OBACKUP" job-status 2>/dev/null)
+                case "$JOB_OUT" in
+                    \{*)
+                        printf '%s\n' "$JOB_OUT"
+                        ;;
+                    *)
+                        json_init
+                        json_add_string "state" "idle"
+                        json_add_string "message" "Nothing is running"
+                        json_add_int "progress" 0
+                        json_dump
+                        ;;
+                esac
+                ;;
+
+            report)
+                json_init
+                if [ -f "$REPORT_FILE" ]; then
+                    json_add_string "report" "$(cat "$REPORT_FILE")"
+                else
+                    json_add_string "report" ""
+                fi
+                json_dump
+                ;;
+
+            *)
+                exit 1
+                ;;
+        esac
+        ;;
+
+    *)
+        exit 1
+        ;;
+esac
