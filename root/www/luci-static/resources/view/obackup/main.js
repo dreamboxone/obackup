@@ -302,7 +302,7 @@ return view.extend({
         var report = (data && data[2] && data[2].report) ? data[2].report : '';
         var backup = (data && data[3]) ? data[3] : {};
         var statusError = (data && data.statusError) ? data.statusError : null;
-        var appVersion = status.version || '1.0.3';
+        var appVersion = status.version || '1.0.4';
 
         /* Every field on this page comes from the obackup ubus object. When
            that object is missing, rpcd has not picked up its plugin, and

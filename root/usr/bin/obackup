@@ -6,7 +6,7 @@
 # GitHub: https://github.com/dreamboxone/obackup
 # Telegram: t.me/routekernel1
 
-OBACKUP_VERSION="1.0.3"
+OBACKUP_VERSION="1.0.4"
 
 . /usr/share/libubox/jshn.sh
 
@@ -729,7 +729,10 @@ download_and_inventory_packages() {
     [ "${total_pkgs:-0}" -gt 0 ] 2>/dev/null || total_pkgs=1
     current_index=0
 
-    while IFS= read -r pname; do
+    # Read on fd 3, not stdin. opkg/apk and the init scripts called inside this
+    # loop read stdin themselves, and anything they swallow is silently lost
+    # from this list - packages simply never get processed.
+    while IFS= read -r pname <&3; do
         [ -n "$pname" ] || continue
         current_index=$(( current_index + 1 ))
 
@@ -757,7 +760,7 @@ download_and_inventory_packages() {
 
         # --- Fetch the exact binary so a restore can work without internet ---
         if [ "$PKG_MGR" = "opkg" ]; then
-            ( cd "$dest_dir/packages" && opkg download "$pname" ) >/dev/null 2>&1
+            ( cd "$dest_dir/packages" && opkg download "$pname" ) </dev/null >/dev/null 2>&1
             found_file=$(find "$dest_dir/packages" -maxdepth 1 \
                 \( -name "${pname}_*.ipk" -o -name "${pname}.ipk" \) 2>/dev/null | head -n1)
             if [ -n "$found_file" ]; then
@@ -788,8 +791,8 @@ download_and_inventory_packages() {
             fi
         else
             if command -v apk >/dev/null 2>&1; then
-                apk fetch -o "$dest_dir/packages" "${pname}=${pver}" >/dev/null 2>&1 ||
-                    apk fetch -o "$dest_dir/packages" "$pname" >/dev/null 2>&1
+                apk fetch -o "$dest_dir/packages" "${pname}=${pver}" </dev/null >/dev/null 2>&1 ||
+                    apk fetch -o "$dest_dir/packages" "$pname" </dev/null >/dev/null 2>&1
                 found_file=$(find "$dest_dir/packages" -maxdepth 1 \
                     -name "${pname}-${pver}.apk" 2>/dev/null | head -n1)
                 [ -n "$found_file" ] || found_file=$(find "$dest_dir/packages" -maxdepth 1 \
@@ -899,7 +902,7 @@ download_and_inventory_packages() {
             [ -x "/etc/init.d/$sname" ] || continue
             grep -Fq "$pname|$sname|" "$dest_dir/manifest/services.list" 2>/dev/null && continue
             is_enabled=0
-            "/etc/init.d/$sname" enabled >/dev/null 2>&1 && is_enabled=1
+            "/etc/init.d/$sname" enabled </dev/null >/dev/null 2>&1 && is_enabled=1
             printf '%s|%s|%s\n' "$pname" "$sname" "$is_enabled" \
                 >> "$dest_dir/manifest/services.list"
         done
@@ -908,9 +911,9 @@ download_and_inventory_packages() {
         printf '%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
             "$pname" "$pver" "${ppkg_sz:-0}" "${porigin:-dependency}" \
             "$artifact_status" "$artifact_file" "$artifact_sha256" \
-            "${artifact_arch:-all}" "$pkind" \
+            "${artifact_arch:-unknown}" "$pkind" \
             >> "$dest_dir/manifest/packages.list"
-    done < "$pkg_processed"
+    done 3< "$pkg_processed"
     rm -f "$pkg_processed" "$origin_map"
 
     # Machine-readable copy of packages.list for anything that wants JSON.
@@ -944,7 +947,7 @@ create_standalone_recovery_script() {
 
     cat << 'RESTORE_SCRIPT_EOF' > "$out_file"
 #!/bin/sh
-# Obackup standalone recovery runner 1.0.3
+# Obackup standalone recovery runner 1.0.4
 #
 # Runs without the Obackup package being installed, so it also works on a
 # freshly flashed router where everything except /etc was wiped.
@@ -1073,18 +1076,120 @@ fi
 logline "migration mode: $MIGRATION ($SOURCE_RELEASE -> $TARGET_RELEASE)"
 
 # ---- 2. Extra package feeds -------------------------------------------
+# A custom feed URL almost always carries the release number. On a version
+# change it would point at packages for the old firmware, so it is redirected
+# at the new release and the original is kept above it as a comment. Applied to
+# opkg and apk alike: a cross-release restore is just as likely on either.
+# Feed URLs carry the release, but not always in full: OpenWrt package trees
+# are published under the major.minor form ("packages-24.10"), while
+# DISTRIB_RELEASE is the point release ("24.10.8"). Both forms are tried.
+release_major_minor() {
+    printf '%s\n' "$1" | awk -F. '{ if (NF >= 2) print $1 "." $2; else print $0 }'
+}
+
+feed_needs_rewrite() {
+    [ "$MIGRATION" = "cross" ] || return 1
+    [ "$SOURCE_RELEASE" != "unknown" ] && [ "$TARGET_RELEASE" != "unknown" ] || return 1
+    grep -Fq "$SOURCE_RELEASE" "$1" 2>/dev/null && return 0
+    grep -Fq "$(release_major_minor "$SOURCE_RELEASE")" "$1" 2>/dev/null && return 0
+    return 1
+}
+
+copy_feed_file() {
+    cf_src="$1"
+    cf_dst="$2"
+
+    if feed_needs_rewrite "$cf_src"; then
+        # awk rather than sed: inserting a line from a substitution needs "\n"
+        # support in the replacement, which is not portable across sed builds.
+        if awk -v oldfull="$SOURCE_RELEASE" -v newfull="$TARGET_RELEASE" \
+               -v oldmm="$(release_major_minor "$SOURCE_RELEASE")" \
+               -v newmm="$(release_major_minor "$TARGET_RELEASE")" '
+                function swap(line, from, to,   pos) {
+                    if (from == "" || from == to) return line
+                    pos = index(line, from)
+                    while (pos > 0) {
+                        line = substr(line, 1, pos - 1) to substr(line, pos + length(from))
+                        pos = index(line, from)
+                    }
+                    return line
+                }
+                $0 ~ /^[[:space:]]*#/ { print; next }
+                index($0, oldfull) > 0 || index($0, oldmm) > 0 {
+                    print "# was: " $0
+                    line = swap($0, oldfull, newfull)
+                    line = swap(line, oldmm, newmm)
+                    print line
+                    next
+                }
+                { print }
+            ' "$cf_src" > "$cf_dst" 2>/dev/null; then
+            logline "rewrote $SOURCE_RELEASE to $TARGET_RELEASE in $(basename "$cf_src")"
+            return 0
+        fi
+    fi
+
+    cp -f "$cf_src" "$cf_dst" 2>/dev/null
+}
+
 if [ -d "$BASE_DIR/repositories" ]; then
     if [ -f "$BASE_DIR/repositories/customfeeds.conf" ] && [ -d /etc/opkg ]; then
-        if [ "$MIGRATION" = "cross" ] && [ "$SOURCE_RELEASE" != "unknown" ] &&
-           [ "$TARGET_RELEASE" != "unknown" ]; then
-            # A feed URL usually carries the release number. Point it at the new
-            # release and keep the original as a comment so it can be restored.
-            sed -e "s|^\(.*\)$SOURCE_RELEASE\(.*\)$|# was: \1$SOURCE_RELEASE\2\n\1$TARGET_RELEASE\2|" \
-                "$BASE_DIR/repositories/customfeeds.conf" > /etc/opkg/customfeeds.conf 2>/dev/null ||
-                cp -f "$BASE_DIR/repositories/customfeeds.conf" /etc/opkg/customfeeds.conf 2>/dev/null
-        else
-            cp -f "$BASE_DIR/repositories/customfeeds.conf" /etc/opkg/customfeeds.conf 2>/dev/null
-        fi
+        copy_feed_file "$BASE_DIR/repositories/customfeeds.conf" /etc/opkg/customfeeds.conf
+    fi
+
+    # An opkg -> apk upgrade is the usual direction, and the two package
+    # managers keep their extra feeds in different files and formats. Without
+    # this conversion the custom feeds are silently dropped and every
+    # third-party package fails to install, which is exactly the case this
+    # tool exists to handle.
+    if [ "$SOURCE_PKG_MGR" = "opkg" ] && [ "$TARGET_PKG_MGR" = "apk" ] &&
+       [ -f "$BASE_DIR/repositories/customfeeds.conf" ] && [ -d /etc/apk ]; then
+        mkdir -p /etc/apk/repositories.d
+        migrated="/etc/apk/repositories.d/obackup-migrated.list"
+        printf '# Converted from the opkg feeds of OpenWrt %s by Obackup.\n' \
+            "$SOURCE_RELEASE" > "$migrated"
+
+        oldmm=$(release_major_minor "$SOURCE_RELEASE")
+        newmm=$(release_major_minor "$TARGET_RELEASE")
+
+        # "src/gz <name> <url>" becomes a bare URL pointing at the apk index.
+        awk '$1 == "src/gz" || $1 == "src" { print $3 }' \
+            "$BASE_DIR/repositories/customfeeds.conf" 2>/dev/null > /tmp/obackup_feedurls.tmp
+
+        while IFS= read -r feed_url <&3; do
+            [ -n "$feed_url" ] || continue
+            case "$feed_url" in
+                http://*|https://*) ;;
+                *) continue ;;
+            esac
+
+            new_url=$feed_url
+            if [ "$SOURCE_RELEASE" != "unknown" ] && [ "$TARGET_RELEASE" != "unknown" ]; then
+                new_url=$(printf '%s\n' "$new_url" | sed -e "s|$SOURCE_RELEASE|$TARGET_RELEASE|g")
+                if [ -n "$oldmm" ] && [ -n "$newmm" ] && [ "$oldmm" != "$newmm" ]; then
+                    new_url=$(printf '%s\n' "$new_url" | sed -e "s|$oldmm|$newmm|g")
+                fi
+            fi
+
+            # apk wants the index file itself; opkg pointed at the directory.
+            case "$new_url" in
+                *.adb) ;;
+                */) new_url="${new_url}packages.adb" ;;
+                *) new_url="$new_url/packages.adb" ;;
+            esac
+
+            # Leave anything the new system already lists alone.
+            if grep -rFqs "$new_url" /etc/apk/repositories.d/ /etc/apk/repositories 2>/dev/null; then
+                logline "custom feed already configured: $new_url"
+                continue
+            fi
+            printf '%s\n' "$new_url" >> "$migrated"
+            logline "converted opkg feed to apk: $feed_url -> $new_url"
+        done 3< /tmp/obackup_feedurls.tmp
+        rm -f /tmp/obackup_feedurls.tmp
+
+        # Only the header line left means there was nothing to carry over.
+        [ "$(grep -c . "$migrated" 2>/dev/null)" -le 1 ] && rm -f "$migrated"
     fi
 
     if [ -d "$BASE_DIR/repositories/repositories.d" ] && [ -d /etc/apk ]; then
@@ -1093,7 +1198,19 @@ if [ -d "$BASE_DIR/repositories" ]; then
             [ -f "$clist" ] || continue
             # Never overwrite the new system's own official feed list.
             [ "$(basename "$clist")" = "distfeeds.list" ] && continue
-            cp -f "$clist" /etc/apk/repositories.d/ 2>/dev/null
+            copy_feed_file "$clist" "/etc/apk/repositories.d/$(basename "$clist")"
+        done
+    fi
+
+    # Public keys for third-party feeds. Existing keys are left alone so the
+    # firmware's own keys are never replaced by older copies.
+    if [ -d "$BASE_DIR/repositories/keys" ] && [ -d /etc/apk ]; then
+        mkdir -p /etc/apk/keys
+        for kfile in "$BASE_DIR/repositories/keys/"*; do
+            [ -f "$kfile" ] || continue
+            [ -f "/etc/apk/keys/$(basename "$kfile")" ] && continue
+            cp -f "$kfile" /etc/apk/keys/ 2>/dev/null
+            logline "restored feed signing key $(basename "$kfile")"
         done
     fi
 fi
@@ -1150,9 +1267,9 @@ refresh_feeds() {
     [ "$FEEDS_REFRESHED" = "1" ] && return 0
     FEEDS_REFRESHED=1
     if [ "$TARGET_PKG_MGR" = "opkg" ]; then
-        opkg update >> "$LOG" 2>&1
+        opkg update </dev/null >> "$LOG" 2>&1
     else
-        apk update >> "$LOG" 2>&1
+        apk update </dev/null >> "$LOG" 2>&1
     fi
     return 0
 }
@@ -1179,15 +1296,15 @@ install_from_artifact() {
     case "$a_file" in
         *.ipk)
             [ "$TARGET_PKG_MGR" = "opkg" ] || return 1
-            opkg install "$art" >> "$LOG" 2>&1 ;;
+            opkg install "$art" </dev/null >> "$LOG" 2>&1 ;;
         *.apk)
             [ "$TARGET_PKG_MGR" = "apk" ] || return 1
             # apk-tools 3 refuses a package that is not in a configured
             # repository ("it would be lost on next reboot", exit 99), which is
             # exactly what a saved file is. Older apk builds do not know the
             # flag, hence the retry without it.
-            apk add --allow-untrusted --force-non-repository "$art" >> "$LOG" 2>&1 ||
-                apk add --allow-untrusted "$art" >> "$LOG" 2>&1 ;;
+            apk add --allow-untrusted --force-non-repository "$art" </dev/null >> "$LOG" 2>&1 ||
+                apk add --allow-untrusted "$art" </dev/null >> "$LOG" 2>&1 ;;
         *) return 1 ;;
     esac
 }
@@ -1206,20 +1323,22 @@ install_from_feed() {
     f_name="$1"; f_ver="$2"
     refresh_feeds
     if [ "$TARGET_PKG_MGR" = "opkg" ]; then
-        if [ "$MIGRATION" = "same" ] && opkg install "${f_name}=${f_ver}" >> "$LOG" 2>&1; then
+        if [ "$MIGRATION" = "same" ] && opkg install "${f_name}=${f_ver}" </dev/null >> "$LOG" 2>&1; then
             return 0
         fi
-        opkg install "$f_name" >> "$LOG" 2>&1
+        opkg install "$f_name" </dev/null >> "$LOG" 2>&1
     else
-        if [ "$MIGRATION" = "same" ] && apk add "${f_name}=${f_ver}" >> "$LOG" 2>&1; then
+        if [ "$MIGRATION" = "same" ] && apk add "${f_name}=${f_ver}" </dev/null >> "$LOG" 2>&1; then
             return 0
         fi
-        apk add "$f_name" >> "$LOG" 2>&1
+        apk add "$f_name" </dev/null >> "$LOG" 2>&1
     fi
 }
 
 if [ -f "$BASE_DIR/manifest/packages.list" ]; then
-    while IFS='|' read -r pname pver psize porigin pstatus pfile psha parch pkind; do
+    # fd 3 again: apk and opkg below read stdin, and whatever they consume
+    # would otherwise vanish from this list.
+    while IFS='|' read -r pname pver psize porigin pstatus pfile psha parch pkind <&3; do
         [ -n "$pname" ] || continue
         TOTAL_PACKAGES=$(( TOTAL_PACKAGES + 1 ))
 
@@ -1285,7 +1404,7 @@ if [ -f "$BASE_DIR/manifest/packages.list" ]; then
             say "  WARN $pname ($inst_ver) : installed, but the backup had $pver"
             WARNINGS=$(( WARNINGS + 1 ))
         fi
-    done < "$BASE_DIR/manifest/packages.list"
+    done 3< "$BASE_DIR/manifest/packages.list"
 fi
 
 # ---- 4. Configuration files -------------------------------------------
@@ -1305,7 +1424,7 @@ keep_original() {
 }
 
 if [ -f "$BASE_DIR/manifest/configs_map.list" ]; then
-    while IFS='|' read -r owner_pkg owner_ver dest_path cfg_type; do
+    while IFS='|' read -r owner_pkg owner_ver dest_path cfg_type <&3; do
         [ -n "$dest_path" ] || continue
 
         if ! grep -Fxq "$owner_pkg" "$INSTALLED_PKGS" 2>/dev/null; then
@@ -1342,21 +1461,59 @@ if [ -f "$BASE_DIR/manifest/configs_map.list" ]; then
             tar -C "$source_item" -cf - . 2>/dev/null | tar -C "$dest_path" -xf - 2>/dev/null
             say "  OK $dest_path : data files restored$version_note"
         fi
-    done < "$BASE_DIR/manifest/configs_map.list"
+    done 3< "$BASE_DIR/manifest/configs_map.list"
 fi
 rm -f "$RESTORED_PATHS"
 
-# ---- 5. Services -------------------------------------------------------
+# ---- 5. Obackup's own page ---------------------------------------------
+# A sysupgrade wipes this package like any other. Its saved .ipk is useless
+# after an opkg -> apk upgrade, and reinstalling from a feed needs the network,
+# so the files are simply copied back from the copy stored in the backup. They
+# are scripts and one JS file, so there is nothing to build or link.
+if [ -d "$BASE_DIR/recovery/self" ]; then
+    if [ ! -x /usr/bin/obackup ] || [ ! -x /usr/libexec/rpcd/obackup ]; then
+        self_restored=0
+        find "$BASE_DIR/recovery/self" -type f 2>/dev/null > /tmp/obackup_selflist.tmp
+        while IFS= read -r sfile <&3; do
+            [ -n "$sfile" ] || continue
+            dest=${sfile#"$BASE_DIR/recovery/self"}
+            [ -n "$dest" ] || continue
+            mkdir -p "$(dirname "$dest")" 2>/dev/null
+            if cp -f "$sfile" "$dest" 2>/dev/null; then
+                case "$dest" in
+                    /usr/bin/*|/usr/libexec/*) chmod 0755 "$dest" 2>/dev/null ;;
+                    *) chmod 0644 "$dest" 2>/dev/null ;;
+                esac
+                self_restored=$((self_restored + 1))
+            fi
+        done 3< /tmp/obackup_selflist.tmp
+        rm -f /tmp/obackup_selflist.tmp
+
+        if [ "$self_restored" -gt 0 ]; then
+            # Without this the ubus object does not exist and the page is dead.
+            /etc/init.d/rpcd reload </dev/null >/dev/null 2>&1 ||
+                /etc/init.d/rpcd restart </dev/null >/dev/null 2>&1
+            rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* 2>/dev/null
+            rm -rf /tmp/luci-modulecache 2>/dev/null
+            logline "put Obackup's own files back ($self_restored files)"
+            say ""
+            say "Obackup put its own page back, so it is usable without"
+            say "reinstalling the package."
+        fi
+    fi
+fi
+
+# ---- 6. Services -------------------------------------------------------
 say ""
 say "[ SERVICES ]"
 
 if [ -f "$BASE_DIR/manifest/services.list" ]; then
-    while IFS='|' read -r spkg ssvc senabled; do
+    while IFS='|' read -r spkg ssvc senabled <&3; do
         [ -n "$ssvc" ] || continue
         [ -x "/etc/init.d/$ssvc" ] || continue
 
         if [ "$senabled" != "1" ]; then
-            "/etc/init.d/$ssvc" disable >/dev/null 2>&1
+            "/etc/init.d/$ssvc" disable </dev/null >/dev/null 2>&1
             say "  OK $ssvc : left disabled, as it was before"
             continue
         fi
@@ -1366,17 +1523,17 @@ if [ -f "$BASE_DIR/manifest/services.list" ]; then
             continue
         fi
 
-        "/etc/init.d/$ssvc" enable >/dev/null 2>&1
-        if "/etc/init.d/$ssvc" restart >> "$LOG" 2>&1; then
+        "/etc/init.d/$ssvc" enable </dev/null >/dev/null 2>&1
+        if "/etc/init.d/$ssvc" restart </dev/null >> "$LOG" 2>&1; then
             say "  OK $ssvc : enabled and started"
         else
             say "  WARN $ssvc : enabled, but it did not start - check its settings"
             WARNINGS=$(( WARNINGS + 1 ))
         fi
-    done < "$BASE_DIR/manifest/services.list"
+    done 3< "$BASE_DIR/manifest/services.list"
 fi
 
-# ---- 6. Summary --------------------------------------------------------
+# ---- 7. Summary --------------------------------------------------------
 printf '{"total_packages":%d,"installed_ok":%d,"failures":%d,"warnings":%d,"migration":"%s","timestamp":%d}\n' \
     "$TOTAL_PACKAGES" "$INSTALLED_OK" "$FAILURES" "$WARNINGS" "$MIGRATION" "$(date +%s)" > "$REPORT_JSON"
 
@@ -1400,6 +1557,26 @@ elif [ "$FAILURES" -eq 0 ]; then
 else
     say "$FAILURES package(s) could not be installed. Details are in $LOG."
     say "If this router has no internet yet, connect it and press Restore again."
+
+    # By far the most common reason on an opkg -> apk upgrade: the third-party
+    # feed those packages came from is not reachable on the new system. Saying
+    # so beats leaving the user to work it out from seven identical lines.
+    if [ "$SOURCE_PKG_MGR" = "opkg" ] && [ "$TARGET_PKG_MGR" = "apk" ]; then
+        say ""
+        say "These packages came from an extra feed, not from OpenWrt itself."
+        say "Moving from OPKG to APK changes how feeds are configured, so:"
+        say "  1. Check that the feed is listed in /etc/apk/repositories.d/"
+        if [ -f /etc/apk/repositories.d/obackup-migrated.list ]; then
+            say "     Obackup converted the old feed addresses into"
+            say "     /etc/apk/repositories.d/obackup-migrated.list - check them."
+        fi
+        say "  2. An extra feed is signed, so its public key must be in"
+        say "     /etc/apk/keys/ or apk will refuse every package from it."
+        say "  3. A project may split its feed differently between releases,"
+        say "     so one address may now be two or three. Check its own"
+        say "     install instructions."
+        say "Then run: apk update && apk add <package>"
+    fi
     say "=================================================="
     logline "=== restore finished: partial ($FAILURES failures) ==="
     touch "$BASE_DIR/recovery/.restore_failed"
@@ -1408,6 +1585,32 @@ fi
 RESTORE_SCRIPT_EOF
 
     chmod 0755 "$out_file"
+}
+
+# Obackup is nothing but shell scripts and one JavaScript file - no compiled
+# parts - so a copy of itself rides along in every backup. After an upgrade the
+# recovery runner can put its own LuCI page back by copying files, with no
+# package manager involved. That matters most on an opkg -> apk upgrade, where
+# the saved .ipk of this package cannot be installed at all.
+OBACKUP_SELF_FILES="/usr/bin/obackup
+/usr/libexec/rpcd/obackup
+/usr/share/luci/menu.d/luci-app-obackup.json
+/usr/share/rpcd/acl.d/luci-app-obackup.json
+/www/luci-static/resources/view/obackup/main.js"
+
+save_self_copy() {
+    self_dir="$1/recovery/self"
+    rm -rf "$self_dir"
+    mkdir -p "$self_dir" || return 1
+
+    printf '%s\n' "$OBACKUP_SELF_FILES" > /tmp/obackup_self.tmp
+    while IFS= read -r sf <&3; do
+        [ -n "$sf" ] || continue
+        [ -f "$sf" ] || continue
+        mkdir -p "$self_dir$(dirname "$sf")"
+        cp -f "$sf" "$self_dir$sf" 2>/dev/null
+    done 3< /tmp/obackup_self.tmp
+    rm -f /tmp/obackup_self.tmp
 }
 
 # The checksum file must not list itself: it is still empty while the hashes
@@ -1470,10 +1673,15 @@ install_boot_hooks() {
 
     cat << 'INIT_SCRIPT_EOF' > /etc/init.d/obackup-restore
 #!/bin/sh /etc/rc.common
-# Obackup post-upgrade restore 1.0.3
+# Obackup post-upgrade restore 1.0.4
 
 START=99
 STOP=01
+
+# rc.common refuses any action it does not know about, so run_now has to be
+# declared before it can be used as one.
+EXTRA_COMMANDS="run_now"
+EXTRA_HELP="	run_now	Run the post-upgrade restore now"
 
 SENTINEL="/usr/lib/obackup/overlay-intact"
 RUN_LOCK="/var/run/obackup-boot-restore.lockdir"
@@ -1497,25 +1705,40 @@ have_default_route() {
 # Only a firmware upgrade should trigger a restore. /usr is wiped by sysupgrade
 # and is not preserved, so the sentinel is missing exactly once: on the first
 # boot of the new firmware. On an ordinary reboot it is still there and the
-# current settings must not be touched.
-should_restore() {
-    [ -f /etc/obackup_restore_pending ] || return 1
-    [ -f "$SENTINEL" ] && return 1
-    return 0
-}
+# current settings must not be touched. That check now lives inline in
+# run_restore so each outcome is written to the log.
 
 mark_done() {
     mkdir -p /usr/lib/obackup 2>/dev/null
     touch "$SENTINEL" 2>/dev/null
 }
 
+note() {
+    printf '[%s] %s\n' "$(date)" "$1" >> "$BOOT_LOG" 2>/dev/null
+}
+
 run_restore() {
-    should_restore || return 0
+    # Logged before any decision, so that an empty or missing log means this
+    # was never invoked at all, rather than leaving that ambiguous.
+    note "boot hook invoked (caller: ${1:-boot})"
+
+    if [ ! -f /etc/obackup_restore_pending ]; then
+        note "nothing pending, so there is no backup waiting to be restored"
+        return 0
+    fi
+    if [ -f "$SENTINEL" ]; then
+        note "sentinel present, so this is an ordinary reboot, not an upgrade"
+        return 0
+    fi
 
     # The uci-defaults trigger and this service can both fire on the same boot.
     # mkdir is atomic, so only one of them proceeds.
-    mkdir "$RUN_LOCK" 2>/dev/null || return 0
+    if ! mkdir "$RUN_LOCK" 2>/dev/null; then
+        note "another attempt already holds the lock"
+        return 0
+    fi
     trap 'rm -rf "$RUN_LOCK"' EXIT INT TERM
+    note "waiting for storage"
 
     runner=""
     # Up to 60 seconds for a USB disk to be detected and mounted.
@@ -1528,11 +1751,12 @@ run_restore() {
     done
 
     if [ -z "$runner" ]; then
-        printf '[%s] No backup storage found after 60 seconds.\n' "$(date)" >> "$BOOT_LOG"
+        note "no backup storage found after 60 seconds"
         touch /etc/obackup_storage_not_found
         rm -rf "$RUN_LOCK"
         return 1
     fi
+    note "found $runner"
 
     # Up to 90 seconds for the connection to come up, so packages can be
     # downloaded. Restoring offline still works, it just cannot reach a feed.
@@ -1543,8 +1767,10 @@ run_restore() {
         sleep 2
     done
 
-    "$runner" >> "$BOOT_LOG" 2>&1
+    note "running the recovery script"
+    "$runner" </dev/null >> "$BOOT_LOG" 2>&1
     ret=$?
+    note "recovery script finished with code $ret"
 
     if [ "$ret" -eq 0 ]; then
         rm -f /etc/obackup_restore_pending /etc/obackup_boot_attempts
@@ -1567,11 +1793,24 @@ run_restore() {
 
 boot() {
     # Detached, so a slow restore never holds up the rest of the boot.
-    run_restore >/dev/null 2>&1 &
+    # Re-executed through setsid where available so the job gets its own
+    # session and cannot be torn down when the boot shell exits - which is the
+    # likeliest reason a boot restore can vanish without leaving a log.
+    self="${initscript:-/etc/init.d/obackup-restore}"
+    if command -v setsid >/dev/null 2>&1 && [ -x "$self" ]; then
+        setsid "$self" run_now </dev/null >/dev/null 2>&1 &
+    else
+        run_restore boot </dev/null >/dev/null 2>&1 &
+    fi
 }
 
 start() {
-    run_restore
+    run_restore manual
+}
+
+# Entry point used by boot() when it re-executes itself detached.
+run_now() {
+    run_restore "${1:-detached}"
 }
 
 stop() {
@@ -1671,6 +1910,11 @@ do_backup() {
     [ -f /etc/opkg/customfeeds.conf ] && cp -f /etc/opkg/customfeeds.conf "$work_dir/repositories/" 2>/dev/null
     [ -d /etc/apk/repositories.d ] && cp -rf /etc/apk/repositories.d "$work_dir/repositories/" 2>/dev/null
 
+    # Third-party apk feeds are signed. Without the matching public keys apk
+    # refuses everything from them after a restore, and the feed URL alone is
+    # useless. They are small, so the whole directory travels with the backup.
+    [ -d /etc/apk/keys ] && cp -rf /etc/apk/keys "$work_dir/repositories/" 2>/dev/null
+
     download_and_inventory_packages "$work_dir" || {
         log "Collecting packages failed"
         rm -rf "$work_dir"
@@ -1681,6 +1925,7 @@ do_backup() {
 
     set_job_status "running" "Writing the recovery script..." 92
     create_standalone_recovery_script "$work_dir"
+    save_self_copy "$work_dir"
 
     set_job_status "running" "Checksumming and signing..." 94
     seal_backup_tree "$work_dir"

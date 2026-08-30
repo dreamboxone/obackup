@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🛡️ Obackup (luci-app-obackup) v1.0.3
+# 🛡️ Obackup (luci-app-obackup) v1.0.4
 
 **Keep your extra packages and their settings when you upgrade OpenWrt**
 *نگهداری بسته‌های نصب‌شده و تنظیمات آن‌ها هنگام ارتقای OpenWrt*
@@ -64,10 +64,36 @@ A plugged-in USB drive is preferred; otherwise the router's own storage under
 `/etc/obackup_storage`, which is registered in `/etc/sysupgrade.conf` so it
 survives the upgrade.
 
-On a USB drive the backup also gets packed into a single
-`obackup-bundle-latest.tar.gz`, handy for copying it off the router. That file
-is a second copy of everything, so it is **not** written to the router's own
-flash, where space is the thing you are short of.
+When the backup lives on a mounted drive — a USB stick, or any other disk
+mounted under `/mnt` or `/media` — it is also packed into a single
+`obackup-bundle-latest.tar.gz`, handy for copying it off the router.
+
+That file is a second copy of everything, so it is **not** written when the
+backup sits on the router's own flash at `/etc/obackup_storage`, which is
+exactly where space is short.
+
+### It puts itself back too
+
+A sysupgrade removes this package like any other, and after an OPKG to APK
+upgrade the saved `.ipk` of it cannot be installed at all. So every backup
+carries a copy of Obackup's own files, and the recovery script copies them back
+into place. No package manager is involved, because there is nothing to build:
+Obackup is shell scripts and one JavaScript file. The LuCI page is there again
+at the first start, without you installing anything by hand.
+
+### Extra package feeds
+
+Whatever feeds you added yourself are saved along with their signing keys,
+because a feed address without its key is useless to APK.
+
+On an OPKG to APK upgrade the two package managers keep their feeds in
+different files and formats, so the old `src/gz` entries are converted into APK
+repository URLs, with the release number in the path pointed at the new
+release. The original is kept above each one as a comment.
+
+That conversion carries over what the old system had. If a project splits its
+feed differently between releases, one address may now be two or three, and the
+restore report says so and points at the feed's own instructions.
 
 ### Removing a backup
 
@@ -85,12 +111,12 @@ Download the file that matches your OpenWrt version from the
 
 **OpenWrt 24.10 and older (OPKG):**
 ```bash
-opkg install /tmp/luci-app-obackup_1.0.3-r1_all.ipk
+opkg install /tmp/luci-app-obackup_1.0.4-r1_all.ipk
 ```
 
 **OpenWrt 25.12 and newer (APK):**
 ```bash
-apk add --allow-untrusted /tmp/luci-app-obackup-1.0.3-r1.apk
+apk add --allow-untrusted /tmp/luci-app-obackup-1.0.4-r1.apk
 ```
 
 Then open **LuCI → System → Obackup**.
@@ -153,9 +179,35 @@ Obackup این بسته‌ها، تنظیمات مربوط به آن‌ها، پ
 روتر در `/etc/obackup_storage` که در `/etc/sysupgrade.conf` ثبت می‌شود تا از
 ارتقا جان سالم به در ببرد.
 
-روی حافظهٔ USB یک فایل فشردهٔ `obackup-bundle-latest.tar.gz` هم ساخته می‌شود که
-برای انتقال پشتیبان به جای دیگر مناسب است. چون این فایل یک نسخهٔ دوم از همه‌چیز
-است، روی فلش داخلی روتر ساخته **نمی‌شود** — همان‌جایی که کمبود فضا دارید.
+اگر پشتیبان روی یک حافظهٔ مانت‌شده باشد — فلش USB یا هر دیسک دیگری که زیر
+`/mnt` یا `/media` مانت شده — یک فایل فشردهٔ `obackup-bundle-latest.tar.gz` هم
+ساخته می‌شود که برای انتقال پشتیبان به جای دیگر مناسب است.
+
+چون این فایل یک نسخهٔ دوم از همه‌چیز است، وقتی پشتیبان روی فلش داخلی روتر در
+`/etc/obackup_storage` باشد ساخته **نمی‌شود** — همان‌جایی که کمبود فضا دارید.
+
+### خودش را هم برمی‌گرداند
+
+ارتقای فریم‌ور این بسته را هم مثل بقیه پاک می‌کند، و پس از ارتقای OPKG به APK
+فایل `.ipk` ذخیره‌شدهٔ خودش اصلاً قابل نصب نیست. برای همین هر پشتیبان یک کپی از
+فایل‌های خود Obackup را با خود دارد و اسکریپت بازیابی آن‌ها را سر جایشان
+برمی‌گرداند. هیچ مدیر بسته‌ای درگیر نمی‌شود، چون چیزی برای ساختن وجود ندارد:
+Obackup فقط چند اسکریپت شل و یک فایل جاوااسکریپت است. صفحهٔ LuCI در نخستین
+راه‌اندازی دوباره در دسترس است، بدون آنکه چیزی نصب کنید.
+
+### فیدهای اختصاصی بسته
+
+فیدهایی که خودتان اضافه کرده‌اید همراه با کلیدهای امضایشان ذخیره می‌شوند، چون
+آدرس فید بدون کلیدش برای APK بی‌فایده است.
+
+در ارتقای OPKG به APK، این دو مدیر بسته فیدها را در فایل‌ها و قالب‌های متفاوتی
+نگه می‌دارند، بنابراین ورودی‌های `src/gz` قدیمی به آدرس مخزن APK تبدیل می‌شوند و
+شمارهٔ نسخه در مسیر به نسخهٔ جدید تغییر می‌کند. آدرس اصلی به‌صورت کامنت بالای هر
+خط نگه داشته می‌شود.
+
+این تبدیل همان چیزی را منتقل می‌کند که سیستم قدیمی داشت. اگر پروژه‌ای ساختار
+فیدهایش را بین دو نسخه عوض کرده باشد، ممکن است یک آدرس حالا دو یا سه آدرس شده
+باشد؛ گزارش بازیابی این را می‌گوید و به راهنمای خود آن پروژه ارجاع می‌دهد.
 
 ### حذف پشتیبان
 
@@ -171,12 +223,12 @@ Obackup این بسته‌ها، تنظیمات مربوط به آن‌ها، پ
 
 **OpenWrt 24.10 و قدیمی‌تر (OPKG):**
 ```bash
-opkg install /tmp/luci-app-obackup_1.0.3-r1_all.ipk
+opkg install /tmp/luci-app-obackup_1.0.4-r1_all.ipk
 ```
 
 **OpenWrt 25.12 و جدیدتر (APK):**
 ```bash
-apk add --allow-untrusted /tmp/luci-app-obackup-1.0.3-r1.apk
+apk add --allow-untrusted /tmp/luci-app-obackup-1.0.4-r1.apk
 ```
 
 سپس به **LuCI → System → Obackup** بروید.

@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-obackup
-PKG_VERSION:=1.0.3
+PKG_VERSION:=1.0.4
 PKG_RELEASE:=1
 PKG_MAINTAINER:=dreamboxone <https://github.com/dreamboxone/obackup>
 PKG_LICENSE:=GPL-3.0-only
