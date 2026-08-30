@@ -1,1 +1,167 @@
+name: Build and Release Obackup Packages
 
+on:
+  push:
+    branches: [main, master]
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PKG_NAME: luci-app-obackup
+  PKG_VERSION: 1.0.4
+  PKG_RELEASE: 1
+
+jobs:
+  build:
+    name: Build ${{ matrix.kind }} (OpenWrt ${{ matrix.release }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: '24.10.5'
+            arch: x86_64-24.10.5
+            kind: ipk
+          - release: '25.12.0'
+            arch: x86_64-25.12.0
+            kind: apk
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Prepare single-package feed
+        shell: bash
+        run: |
+          set -eu
+          rm -rf feed
+          mkdir -p feed/${PKG_NAME}
+          cp -a Makefile root feed/${PKG_NAME}/
+          find feed -type f | sort
+
+      - name: Build with the official OpenWrt SDK
+        uses: openwrt/gh-action-sdk@main
+        env:
+          ARCH: ${{ matrix.arch }}
+          FEEDNAME: obackup
+          FEED_DIR: ${{ github.workspace }}/feed
+          PACKAGES: ${{ env.PKG_NAME }}
+          NO_SHFMT_CHECK: 1
+          NO_REFRESH_CHECK: 1
+          V: s
+
+      - name: Show build logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "::group::build logs"
+          find logs -type f -print 2>/dev/null | while read -r f; do
+            echo "----- $f -----"
+            tail -n 200 "$f"
+          done
+          echo "::endgroup::"
+
+      - name: Collect package
+        id: collect
+        shell: bash
+        run: |
+          set -eu
+          out="dist/${{ matrix.kind }}"
+          mkdir -p "$out"
+          find bin -type f -name "${PKG_NAME}[-_]*.${{ matrix.kind }}" -exec cp -f {} "$out/" \;
+          ls -l "$out"
+          count=$(find "$out" -type f -name "*.${{ matrix.kind }}" | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "Expected exactly 1 .${{ matrix.kind }}, found $count"
+            find bin -type f -name '*.ipk' -o -name '*.apk' | head -50
+            exit 1
+          fi
+          echo "pkg=$(find "$out" -type f -name "*.${{ matrix.kind }}")" >> "$GITHUB_OUTPUT"
+
+      # OpenWrt .ipk files are gzip-compressed tar archives (they have not used
+      # the ar container for years), so validate them with tar, not `ar`.
+      - name: Validate IPK
+        if: matrix.kind == 'ipk'
+        shell: bash
+        run: |
+          set -eu
+          pkg='${{ steps.collect.outputs.pkg }}'
+          members=$(tar -tzf "$pkg")
+          echo "$members"
+          case "$members" in
+            *control.tar.gz*) ;;
+            *) echo "control.tar.gz missing"; exit 1 ;;
+          esac
+          case "$members" in
+            *data.tar.gz*) ;;
+            *) echo "data.tar.gz missing"; exit 1 ;;
+          esac
+          tar -zxOf "$pkg" ./control.tar.gz | tar -zxOf - ./control > control.txt
+          cat control.txt
+          grep -qx "Package: ${PKG_NAME}" control.txt
+          grep -qx "Version: ${PKG_VERSION}-r${PKG_RELEASE}" control.txt
+          grep -qx "Architecture: all" control.txt
+
+      # OpenWrt 25.12 ships apk-tools v3 packages. Those are ADB containers
+      # (magic "ADB"), NOT gzip tarballs -- running `tar -tzf` on one makes tar
+      # exit 2, which is what used to fail this workflow.
+      - name: Validate APK
+        if: matrix.kind == 'apk'
+        shell: bash
+        run: |
+          set -eu
+          pkg='${{ steps.collect.outputs.pkg }}'
+          magic=$(head -c 3 "$pkg")
+          echo "container magic: $magic"
+          if [ "$magic" != "ADB" ]; then
+            echo "Unexpected apk container magic: $magic"
+            exit 1
+          fi
+          base=$(basename "$pkg")
+          expected="${PKG_NAME}-${PKG_VERSION}-r${PKG_RELEASE}.apk"
+          echo "filename: $base (expected $expected)"
+          [ "$base" = "$expected" ]
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: obackup-${{ matrix.kind }}
+          path: dist/${{ matrix.kind }}/*.${{ matrix.kind }}
+          if-no-files-found: error
+
+  release:
+    name: Publish Release Assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: obackup-*
+          merge-multiple: true
+          path: release
+
+      - name: List release assets
+        shell: bash
+        run: |
+          set -eu
+          find release -type f -print
+          [ "$(find release -type f -name '*.ipk' | wc -l)" -eq 1 ]
+          [ "$(find release -type f -name '*.apk' | wc -l)" -eq 1 ]
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Obackup ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release/*.ipk
+            release/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
